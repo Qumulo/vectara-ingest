@@ -9,7 +9,7 @@ crawling:
 website_crawler:
   urls: [https://docs.qumulo.com]
   pos_regex: [".*docs.qumulo.*"]
-  #neg_regex: ["https:\/\/docs\.qumulo\.com\/[a-zA-Z0-9\-]+\/[a-zA-Z0-9\-]+\/index\.html","https:\/\/docs\.qumulo\.com\/[a-zA-Z0-9\-]+\/index\.html"]
+  neg_regex: ['https:\/\/docs\.qumulo\.com\/[a-zA-Z0-9\-]+\/[a-zA-Z0-9\-]+\/index\.html','https:\/\/docs\.qumulo\.com\/[a-zA-Z0-9\-]+\/index\.html']
   pages_source: sitemap
   extraction: playwright
   delay: 1
