@@ -15,4 +15,5 @@ website_crawler:
   delay: 1
   max_depth: 2
   #ray_workers: 2
+  remove_old_content: true
   remove_boilerplate: true
