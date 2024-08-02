@@ -1,18 +1,13 @@
 import logging
 import os
-from usp.tree import sitemap_tree_for_homepage
 from core.crawler import Crawler, recursive_crawl
-from core.utils import clean_urls, archive_extensions, img_extensions, get_file_extension, RateLimiter, setup_logging
+from core.utils import clean_urls, archive_extensions, img_extensions, get_file_extension, RateLimiter, setup_logging, get_urls_from_sitemap
 from core.indexer import Indexer
 import re
 from typing import List, Set
 
 import ray
 import psutil
-
-# disable USP annoying logging
-logging.getLogger("usp.fetch_parse").setLevel(logging.ERROR)
-logging.getLogger("usp.helpers").setLevel(logging.ERROR)
 
 
 class PageCrawlWorker(object):
@@ -52,7 +47,7 @@ class PageCrawlWorker(object):
             logging.info(f"Crawling and indexing {url}")
             try:
                 with self.rate_limiter:
-                    succeeded = self.indexer.index_url(url, metadata=metadata)
+                    succeeded = self.indexer.index_url(url, metadata=metadata, html_processing=self.crawler.html_processing)
                 if not succeeded:
                     logging.info(f"Indexing failed for {url}")
                 else:
@@ -71,13 +66,13 @@ class WebsiteCrawler(Crawler):
         self.pos_regex = [re.compile(r) for r in self.cfg.website_crawler.get("pos_regex", [])]
         self.neg_regex = [re.compile(r) for r in self.cfg.website_crawler.get("neg_regex", [])]
         keep_query_params = self.cfg.website_crawler.get('keep_query_params', False)
+        self.html_processing = self.cfg.website_crawler.get('html_processing', {})
 
         # grab all URLs to crawl from all base_urls
         all_urls = []
         for homepage in base_urls:
             if self.cfg.website_crawler.pages_source == "sitemap":
-                tree = sitemap_tree_for_homepage(homepage)
-                urls = list(set([page.url for page in tree.all_pages()]))
+                urls = get_urls_from_sitemap(homepage)
             elif self.cfg.website_crawler.pages_source == "crawl":
                 max_depth = self.cfg.website_crawler.get("max_depth", 3)
                 urls_set = recursive_crawl(homepage, max_depth, 
@@ -98,7 +93,6 @@ class WebsiteCrawler(Crawler):
         if self.neg_regex and len(self.neg_regex)>0:
             urls = [u for u in all_urls if not any([r.match(u) for r in self.neg_regex])]
         urls = list(set(urls))
-
 
         # Store URLS in crawl_report if needed
         if self.cfg.website_crawler.get("crawl_report", False):
@@ -147,7 +141,7 @@ class WebsiteCrawler(Crawler):
             for doc in docs_to_remove:
                 if doc['url']:
                     self.indexer.delete_doc(doc['doc_id'])
-            logging.info(f"Removing {len(docs_to_remove)} that are not included in the crawl but are in the corpus.")
+            logging.info(f"Removing {len(docs_to_remove)} docs that are not included in the crawl but are in the corpus.")
             if self.cfg.website_crawler.get("crawl_report", False):
                 with open('/home/vectara/env/urls_removed.txt', 'w') as f:
                     for url in sorted([t['url'] for t in docs_to_remove if t['url']]):

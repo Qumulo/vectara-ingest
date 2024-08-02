@@ -11,8 +11,9 @@ import psutil
 import ray
 
 class UrlCrawlWorker(object):
-    def __init__(self, indexer: Indexer, num_per_second: int):
+    def __init__(self, indexer: Indexer, crawler: Crawler, num_per_second: int):
         self.indexer = indexer
+        self.crawler = crawler
         self.rate_limiter = RateLimiter(num_per_second)
 
     def setup(self):
@@ -21,13 +22,13 @@ class UrlCrawlWorker(object):
 
     def process(self, url: str, source: str):
         if url is None:
-            logging.info(f"URL is None, skipping")
+            logging.info("URL is None, skipping")
             return -1
         metadata = {"source": source, "url": url}
         logging.info(f"Crawling and indexing {url}")
         try:
             with self.rate_limiter:
-                succeeded = self.indexer.index_url(url, metadata=metadata)
+                succeeded = self.indexer.index_url(url, metadata=metadata, html_processing=self.crawler.html_processing)
             if not succeeded:
                 logging.info(f"Indexing failed for {url}")
             else:
@@ -90,6 +91,8 @@ class DocsCrawler(Crawler):
             try:
                 with rate_limiter:
                     url, page_content = self.get_url_content(url)
+                if url is None:
+                    continue
                 self.crawled_urls.add(url)
 
                 # Find all the new URLs in the page's content and add them into the queue
@@ -104,7 +107,7 @@ class DocsCrawler(Crawler):
                             (abs_url.startswith("http")) and                                                # starts with http/https
                             (abs_url not in self.ignored_urls) and                                          # not previously ignored    
                             (len(urlparse(abs_url).fragment)==0) and                                        # does not have fragment
-                            (any([abs_url.endswith(ext) for ext in self.extensions_to_ignore])==False)):    # not any of the specified extensions to ignore
+                            (not any([abs_url.endswith(ext) for ext in self.extensions_to_ignore]))):    # not any of the specified extensions to ignore
                                 # add URL if needed
                                 if abs_url not in self.crawled_urls and abs_url not in new_urls:
                                     new_urls.append(abs_url)
@@ -122,6 +125,7 @@ class DocsCrawler(Crawler):
         self.extensions_to_ignore = list(set(self.cfg.docs_crawler.extensions_to_ignore + binary_extensions))
         self.pos_regex = [re.compile(r) for r in self.cfg.docs_crawler.get("pos_regex", [])]
         self.neg_regex = [re.compile(r) for r in self.cfg.docs_crawler.get("neg_regex", [])]
+        self.html_processing = self.cfg.docs_crawler.get('html_processing', {})
 
         self.session = create_session_with_retries()
 
@@ -136,7 +140,7 @@ class DocsCrawler(Crawler):
         if self.cfg.docs_crawler.get("crawl_report", False):
             logging.info(f"Collected {len(self.crawled_urls)} URLs to crawl and index. See urls_indexed.txt for a full report.")
             with open('/home/vectara/env/urls_indexed.txt', 'w') as f:
-                for url in sorted(self.crawled_urls):
+                for url in sorted(list(self.crawled_urls)):
                     f.write(url + '\n')
         else:
             logging.info(f"Collected {len(self.crawled_urls)} URLs to crawl and index.")
@@ -147,14 +151,14 @@ class DocsCrawler(Crawler):
             logging.info(f"Using {ray_workers} ray workers")
             self.indexer.p = self.indexer.browser = None
             ray.init(num_cpus=ray_workers, log_to_driver=True, include_dashboard=False)
-            actors = [ray.remote(UrlCrawlWorker).remote(self.indexer, num_per_second) for _ in range(ray_workers)]
+            actors = [ray.remote(UrlCrawlWorker).remote(self.indexer, self, num_per_second) for _ in range(ray_workers)]
             for a in actors:
                 a.setup.remote()
             pool = ray.util.ActorPool(actors)
             _ = list(pool.map(lambda a, u: a.process.remote(u, source=source), self.crawled_urls))
                 
         else:
-            crawl_worker = UrlCrawlWorker(self.indexer, num_per_second)
+            crawl_worker = UrlCrawlWorker(self.indexer, self, num_per_second)
             for inx, url in enumerate(self.crawled_urls):
                 if inx % 100 == 0:
                     logging.info(f"Crawling URL number {inx+1} out of {len(self.crawled_urls)}")
@@ -168,7 +172,7 @@ class DocsCrawler(Crawler):
             for doc in docs_to_remove:
                 if doc['url']:
                     self.indexer.delete_doc(doc['doc_id'])
-            logging.info(f"Removing {len(docs_to_remove)} that are not included in the crawl but are in the corpus.")
+            logging.info(f"Removing {len(docs_to_remove)} docs that are not included in the crawl but are in the corpus.")
             if self.cfg.docs_crawler.get("crawl_report", False):
                 with open('/home/vectara/env/urls_removed.txt', 'w') as f:
                     for url in sorted([t['url'] for t in docs_to_remove if t['url']]):

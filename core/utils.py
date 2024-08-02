@@ -4,10 +4,13 @@ from urllib.parse import urlparse, urlunparse, ParseResult
 from pathlib import Path
 
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+
 import re
 from typing import List, Set
 import os
 import sys
+import shutil
 
 import time
 import threading
@@ -39,33 +42,42 @@ def setup_logging():
     handler.setFormatter(formatter)
     root.addHandler(handler)
 
-
-def remove_code_from_html(html_text: str) -> str:
+def remove_code_from_html(html: str) -> str:
     """Remove code and script tags from HTML."""
-    soup = BeautifulSoup(html_text, 'html.parser')
-    for tag in soup.find_all(['code', 'script']):
-        tag.decompose()
+    soup = BeautifulSoup(html, 'html5lib')
+    for element in soup.find_all(['code']):
+        element.decompose()
     return str(soup)
 
-def html_to_text(html: str, remove_code: bool = False) -> str:
-    """Convert HTML to text."""
+def html_to_text(html: str, remove_code: bool = False, html_processing: dict = {}) -> str:
+    """Convert HTML to text, optionally removing code blocks."""
+
+    # Remove code blocks if specified
     if remove_code:
         html = remove_code_from_html(html)
 
-    # Add spaces before and after list items
-    soup = BeautifulSoup(html, features='html.parser')
-    for ul in soup.find_all(['ul', 'ol']):
-        # Add a space before the list if it directly follows text (e.g., a paragraph)
-        prev_sib = ul.find_previous_sibling()
-        if prev_sib and prev_sib.name not in ['ul', 'ol', 'li']:  # Avoid double-spacing with adjacent lists
-            ul.insert_before(' ')  # Insert a space before the list
-        for li in ul.find_all('li'):
-            # Insert a space at the beginning of each list item
-            li.insert_before(' ')
-            # Optionally, insert a space at the end of each list item
-            # li.append(' ')
+    # Initialize BeautifulSoup
+    soup = BeautifulSoup(html, 'html5lib')
 
-    return soup.get_text()
+    # Remove unwanted HTML elements
+    for element in soup.find_all(['script', 'style']):
+        element.decompose()
+
+    # remove any HTML items with the specified IDs
+    ids_to_remove = html_processing.get('ids_to_remove', [])
+    for id in ids_to_remove:
+        for element in soup.find_all(id=id):
+            element.decompose()
+
+    # remove any HTML tags
+    tags_to_remove = html_processing.get('tags_to_remove', [])
+    for tag in tags_to_remove:
+        for element in soup.find_all(tag):
+            element.decompose()
+
+    text = soup.get_text(' ', strip=True).replace('\n', ' ')
+    return text
+
 
 def create_session_with_retries(retries: int = 3) -> requests.Session:
     """Create a requests session with retries."""
@@ -112,7 +124,7 @@ def detect_language(text: str) -> str:
         lang = detect(text)
         return str(lang)
     except Exception as e:
-        print(f"Language detection failed with error: {e}")
+        logging.info(f"Language detection failed with error: {e}")
         return "en"  # Default to English in case of errors
 
 def get_file_size_in_MB(file_path: str) -> float:
@@ -126,6 +138,13 @@ def get_file_extension(url):
     # Use pathlib to extract the file extension
     return Path(path).suffix.lower()
 
+def ensure_empty_folder(folder_name):
+    # Check if the folder exists
+    if os.path.exists(folder_name):
+        # Remove the folder and all its contents
+        shutil.rmtree(folder_name)
+    # Create the folder anew
+    os.makedirs(folder_name)
 
 class TableSummarizer():
     def __init__(self, openai_api_key: str):
@@ -133,10 +152,16 @@ class TableSummarizer():
 
     def summarize_table_text(self, text: str):
         response = self.client.chat.completions.create(
-            model="gpt-4-1106-preview",   # GPT4-Turbo
+            model="gpt-4o",   # GPT4o
             messages=[
                 {"role": "system", "content": "You are a helpful assistant tasked with summarizing tables."},
-                {"role": "user", "content": f"Give a concise and comprehensive summary of the table. Table chunk: {text} "},
+                {"role": "user", "content": f"""
+                    Adopt the perspective of a data analyst. 
+                    Summarize the key results reported in this table without omitting critical details.
+                    Make sure your summary is concise, informative and comprehensive.
+                    Table chunk: {text} 
+                 """
+                }
             ],
             temperature=0
         )
@@ -187,3 +212,48 @@ class RateLimiter:
         with self.lock:
             self.condition.notify()
 
+def get_urls_from_sitemap(homepage_url):
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+    # Helper function to fetch and parse XML
+    def fetch_sitemap(sitemap_url):
+        try:
+            response = requests.get(sitemap_url, headers=headers)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'xml')
+            return soup
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"Failed to fetch sitemap: {sitemap_url} due to {e}")
+            return None
+    
+    # Step 1: Check for standard sitemap.xml
+    sitemap_url = urljoin(homepage_url, 'sitemap.xml')
+    soup = fetch_sitemap(sitemap_url)
+    
+    sitemaps = []
+    if soup:
+        sitemaps.append(sitemap_url)
+    
+    # Step 2: Check for sitemaps in robots.txt
+    robots_url = urljoin(homepage_url, 'robots.txt')
+    try:
+        response = requests.get(robots_url, headers=headers)
+        response.raise_for_status()
+        for line in response.text.split('\n'):
+            if line.lower().startswith('sitemap:'):
+                sitemap_url = line.split(':', 1)[1].strip()
+                sitemaps.append(sitemap_url)
+    except requests.exceptions.RequestException as e:
+        logging.info(f"Failed to fetch robots.txt: {robots_url} due to {e}")
+    
+    # Step 3: Extract URLs from all found sitemaps
+    urls = set()
+    for sitemap in sitemaps:
+        soup = fetch_sitemap(sitemap)
+        if soup:
+            for loc in soup.find_all('loc'):
+                urls.add(loc.text.strip())
+    
+    return list(urls)

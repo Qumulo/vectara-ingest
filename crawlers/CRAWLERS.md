@@ -26,6 +26,9 @@ website_crawler:
     pages_source: crawl
     max_depth: 3      # only needed if pages_source is set to 'crawl'
     extraction: playwright
+    html_processing:
+      ids_to_remove: [td-123]
+      tags_to_remove: [nav]
     keep_query_params: false
     crawl_report: false
     remove_old_content: false
@@ -49,7 +52,11 @@ Other parameters:
 - `crawl_report`: if true, creates a file under ~/tmp/mount called `urls_indexed.txt` that lists all URLs crawled
 - `remove_old_content`: if true, removes any URL that currently exists in the corpus but is NOT in this crawl. CAUTION: this removes data from your corpus. 
 If `crawl_report` is true then the list of URLs associated with the removed documents is listed in `urls_removed.txt`
- 
+
+The `html_processing` configuration defines a set of special instructions that can be used to ignore some content when extracting text from HTML:
+- `ids_to_remove` defines an (optional) list of HTML IDs that are ignored when extracting text from the page.
+- `tags_to_remove` defines an (optional) list of HTML semantic tags (like header, footer, nav, etc) that are ignored when extracting text from the page.
+
 <br>**Note**: when specifying regular expressions it's recommended to use single quotes (as opposed to double quotes) to avoid issues with escape characters.
 
 `ray_workers`, if defined, specifies the number of ray workers to use for parallel processing. ray_workers=0 means dont use Ray. ray_workers=-1 means use all cores available.
@@ -85,29 +92,61 @@ In the above example, the crawler would
 2. Group all rows that have the same values for `postal_code` into the same Vectara document
 3. Each such Vectara document that is indexed, will include several sections (one per row), each representing the textual fields `business_name` and `review_text` and including the meta-data fields `city`, `state` and `postal_code`.
 
+### Huggingface dataset crawler
+
+```yaml
+...
+hfdataset_crawler:
+    dataset_name: "coeuslearning/hotel_reviews"
+    split: "train"
+    select_condition: "city='New York City, USA'"
+    num_rows: 55
+    title_column: hotel
+    text_columns: [review]
+    metadata_columns: [city, hotel]
+```
+The database crawler can be used to read data from a relational database and index relevant columns into Vectara.
+- `dataset_name` the huggingface dataset name
+- `split` the "split" of the dataset in the HF datasets hub (e.g. "train", or "test", or "corpus"; look at DS card to determine)
+- `select_condition` optional condition to filter rows in the table by
+- `num_rows` if specified limits the dataset size by number of specified rows
+- `id_column` optional column for the ID of the dataset. Must be unique if used
+- `text_columns` a list of column names that include textual information we want to use as the main text indexed into vectara. The code concatenates these columns for each row.
+- `title_column` is an optional column name that will hold textual information to be used as title at the document level.
+- `metadata_columns` a list of column names that we want to use as metadata.
+
+In the above example, the crawler would
+1. Include all rows in the dataset that are from NYC
+2. Each Vectara document that is indexed, will include a title as the value of `hotel` and text from `review`. The metadata will include the fields `city` and `hotel`.
+3. include only the first 55 rows matching the condition
+
 ### CSV crawler
 
 ```yaml
 ...
 csv_crawler:
-    csv_path: "/path/to/Game_of_Thrones_Script.csv"
+    file_path: "/path/to/Game_of_Thrones_Script.csv"
     doc_id_columns: [Season, Episode]
     text_columns: [Name, Sentence]
     metadata_columns: ["Season", "Episode", "Episode Title"]
     separator: ','
+    sheet_name: "my-sheet"
 ```
-The csv crawler is similar to the database crawler, but instead of pulling data from a database, it uses a local CSV file.
+The csv crawler is similar to the database crawler, but instead of pulling data from a database, it uses a local CSV or XLSX file.
 - `select_condition` optional condition to filter rows in the table by
 - `doc_id_columns` defines one or more columns that will be used as a document ID, and will aggregate all rows associated with this value into a single Vectara document. This will also be used as the title. If this is not specified, the code will aggregate every `rows_per_chunk` (default 500) rows.
 - `text_columns` a list of column names that include textual information we want to use 
 - `title_column` is an optional column name that will hold textual information to be used as title
 - `metadata_columns` a list of column names that we want to use as metadata
-- `separator` a string that will be used as a separator in the CSV file (default ',')
+- `separator` a string that will be used as a separator in the CSV file (default ',') (relevant only for CSV files)
+- `sheet_name` the name of the sheet in the XLSX file to use (relevant only for XLSX files)
 
 In the above example, the crawler would
 1. Read all the data from the local CSV file under `/path/to/Game_of_Thrones_Script.csv`
 2. Group all rows that have the same values for both `Season` and `Episode` into the same Vectara document
 3. Each such Vectara document that is indexed, will include several section (one per row), each representing the textual fields `Name` and `Sentence` and including the meta-data fields `Season`, `Episode` and `Episode Title`.
+
+Note that the type of file is determined by it's extension (e.g. CSV vs XLSX)
 
 ### Bulk Upload crawler
 
@@ -171,9 +210,12 @@ The hackernews crawler can be used to crawl stories and comments from hacker new
     pos_regex: [".*vectara.com/docs.*"]
     neg_regex: [".*vectara.com/docs/rest-api/.*"]
     num_per_second: 10
-    extensions_to_ignore: ["php", "java", "py", "js"]
+    extensions_to_ignore: [".php", ".java", ".py", ".js"]
     docs_system: docusaurus
     remove_code: true
+    html_processing:
+      ids_to_remove: []
+      tags_to_remove: [footer]
     crawl_report: false
     remove_old_content: false
     ray_workers: 0
@@ -191,6 +233,10 @@ It has two parameters
 - `crawl_report`: if true, creates a file under ~/tmp/mount called `urls_indexed.txt` that lists all URLs crawled
 - `remove_old_content`: if true, removes any URL that currently exists in the corpus but is NOT in this crawl. CAUTION: this removes data from your corpus. 
 If `crawl_report` is true then the list of URLs associated with the removed documents is listed in `urls_removed.txt`
+
+The `html_processing` configuration defines a set of special instructions that can be used to ignore some content when extracting text from HTML:
+- `ids_to_remove` defines an (optional) list of HTML IDs that are ignored when extracting text from the page.
+- `tags_to_remove` defines an (optional) list of HTML semantic tags (like header, footer, nav, etc) that are ignored when extracting text from the page.
 
 <br>**Note**: when specifying regular expressions it's recommended to use single quotes (as opposed to double quotes) to avoid issues with escape characters.
 
@@ -262,8 +308,17 @@ The JIRA crawler indexes issues and comments into Vectara.
 To setup Notion you will have to setup a [Notion integration](https://www.notion.so/help/create-integrations-with-the-notion-api),
 and [share the pages](https://www.notion.so/help/add-and-manage-connections-with-the-api) you want indexed with this connection.
 
-The Notion crawler has no specific parameters, except the `NOTION_API_KEY` (which is associated with your custom integration)
-that needs to be specified in the `secrets.toml` file. The crawler will index any content on your notion instance.
+```yaml
+...
+  notion_crawler:
+    remove_old_content: false
+```
+
+The notion crawler indexes notion pages into Vectara:
+- `remove_old_content`: if true, removes any document that currently exists in the corpus but is NOT in this crawl. CAUTION: this removes data from your corpus. 
+
+For this crawler, you need to specify `NOTION_API_KEY` (which is associated with your custom integration) in the `secrets.toml` file. 
+
 
 ### Hubspot crawler
 
@@ -299,6 +354,19 @@ Note that the local path you specify is mapped into a fixed location in the dock
 The S3 crawler indexes all content that's in a specified S3 bucket path.
 - `s3_path`: a valid S3 location where the files to index reside
 - `extensions`: list of file extensions to be included. If one of those extensions is '*' then all files would be crawled, disregarding any other extensions in that list.
+
+### Youtube crawler
+
+```yaml
+...
+  yt_crawler:
+    playlist_url: <some-yotube-playlist-url>
+    whisper_model: base
+```
+
+The Youtube crawler loads all videos from a playlist, extracts the subtitles into text (or transcribes the audio if subtitles don't exist), and indexes that text.
+- `playlist_url`: a valid youtube playlist URL
+- `whisper_model`: the model name for whisper: tiny, base, small, medium or large. Defaults to base. Only used if subtitles don't exist.
 
 ### Slack crawler
 

@@ -28,7 +28,7 @@ class HackernewsCrawler(Crawler):
             except Exception as e:
                 logging.info(f"Error retrieving comment {kid}, e={e}")
                 comment = None
-            if comment is not None and comment.get('type', '') == 'comment':
+            if comment is not None and comment.get('type', '') == 'comment' and not comment.get('dead', False):
                 comments.append(comment)
                 comments += self.get_comments(comment)
         return comments
@@ -36,32 +36,46 @@ class HackernewsCrawler(Crawler):
     def index_story(self, id: str) -> None:
         url = f'https://news.ycombinator.com/item?id={id}'
         story = self.session.get(self.db_url + 'item/{}.json'.format(id)).json()
-        doc_id = str(story['id'])
+        doc_id = 'hn_story_' + str(story['id'])
         doc_title = html_to_text(story.get('title', ''))
         doc_text = html_to_text(story.get('text', ''))
         story_date = datetime.datetime.fromtimestamp(story['time']).strftime('%Y-%m-%d')
-        doc_metadata = {'source': 'hackernews', 'title': doc_title, 'url': url, 'date': story_date}
-        texts = [] if len(doc_text) == 0 else [doc_text]
-        titles = ['']
-        times = [datetime.datetime.fromtimestamp(story.get('time', 0)).date()]
+        doc_metadata = {'source': 'hackernews', 'title': doc_title, 'url': url, 
+                        'story_url': story.get('url', ''), 'date': story_date, 'by': story.get('by', '')}
+
+        texts = []
+        titles = []
+        times = []
+        metadatas = []
+        if len(doc_text) > 0:
+            texts = [doc_text]
+            titles = [doc_title]
+            times = [datetime.datetime.fromtimestamp(story.get('time', 0)).date()]
+            metadatas.append({})
+        
         comments = self.get_comments(story)
         for comment in comments:
             texts.append(html_to_text(comment.get('text', '')))
             titles.append(html_to_text(comment.get('title', '')))
-            times.append(datetime.datetime.fromtimestamp(comment.get('time', 0)).date())
-        
+            comment_date = datetime.datetime.fromtimestamp(comment.get('time', 0)).date()
+            comment_author = comment.get('by', '')
+            times.append(comment_date)
+            metadatas.append({'by': comment_author, 'date': comment_date.strftime('%Y-%m-%d'), 
+                              'url': url + f'#{comment["id"]}'})
+
         # if most recent comment is older than days_back, don't index
-        if max(times) < datetime.datetime.now().date() - datetime.timedelta(days=self.days_back):
-            logging.info(f"Skipping story {id} because most recent comment is older than {self.days_back} days")
+        if len(times)>0 and max(times) < datetime.datetime.now().date() - datetime.timedelta(days=self.days_back):
+            logging.info(f"Skipping story {id} from date {story_date} because most recent comment is older than {self.days_back} days")
             return
             
         if len(texts) == 0:
-            logging.info(f"Skipping story {id} because it has no text")
+            if self.verbose:
+                logging.info(f"Skipping story {id} from date {story_date} because it has no text")
             return
         
         self.indexer.index_segments(doc_id=doc_id, 
-                                    texts=texts, titles=titles, metadatas=None,
-                                    doc_metadata=doc_metadata, doc_title=doc_title)
+                                    texts=texts, titles=titles, metadatas=metadatas,
+                                    doc_metadata=doc_metadata, doc_title=None)
 
     def fetch_stories_before_n_days(self, days: int = 7):
         # Find the current highest item ID
@@ -70,7 +84,7 @@ class HackernewsCrawler(Crawler):
 
         # Calculate the cutoff timestamp
         cutoff_date = datetime.datetime.now() - datetime.timedelta(days=days)
-        logging.info(f"Fetching stories from the last {days} days, cutoff date={cutoff_date}")
+        logging.info(f"Fetching stories from the last {days} days, cutoff date is {cutoff_date.date()}")
         
         # List to hold IDs of stories before and up to N days ago
         stories_ids = []
@@ -83,7 +97,7 @@ class HackernewsCrawler(Crawler):
                 continue
             item_date = datetime.datetime.fromtimestamp(item.get("time"))
             if inx % 100 == 0:
-                logging.info(f"Checked {inx} items so far, latest item with date {item_date}")
+                logging.info(f"Checked {inx} items so far, latest item with date {item_date.strftime('%Y-%m-%d')}")
 
             # Check if item is a story and was published within the desired time frame
             if item and item.get("type") == "story":
@@ -104,6 +118,7 @@ class HackernewsCrawler(Crawler):
         stories_by_list = list(set(list(resp1.json()) + list(resp2.json()) + list(resp3.json()) + 
                            list(resp4.json()) + list(resp5.json())))
         logging.info(f"Retrieved {len(stories_by_list)} top, new, best, show, and ask stories")
+        self.verbose = self.cfg.vectara.get("verbose", False)
 
         if self.days_back_comprehensive:
             stories_by_date = self.fetch_stories_before_n_days(self.days_back)
