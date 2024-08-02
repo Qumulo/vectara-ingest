@@ -2,6 +2,7 @@ vectara:
   corpus_id: 2
   customer_id: 4077139778
   reindex: true
+  remove_boilerplate: true
 
 crawling:
   crawler_type: website
@@ -14,6 +15,8 @@ website_crawler:
   extraction: playwright
   delay: 1
   max_depth: 2
-  #ray_workers: 2
+  ray_workers: 2
   remove_old_content: true
-  remove_boilerplate: true
+  html_processing:
+    ids_to_remove: [tg-sb-sidebar,cookie-banner]
+    #tags_to_remove: [bar]
