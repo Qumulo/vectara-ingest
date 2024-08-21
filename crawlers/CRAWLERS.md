@@ -29,6 +29,7 @@ website_crawler:
     html_processing:
       ids_to_remove: [td-123]
       tags_to_remove: [nav]
+      classes_to_remove: []
     keep_query_params: false
     crawl_report: false
     remove_old_content: false
@@ -56,6 +57,7 @@ If `crawl_report` is true then the list of URLs associated with the removed docu
 The `html_processing` configuration defines a set of special instructions that can be used to ignore some content when extracting text from HTML:
 - `ids_to_remove` defines an (optional) list of HTML IDs that are ignored when extracting text from the page.
 - `tags_to_remove` defines an (optional) list of HTML semantic tags (like header, footer, nav, etc) that are ignored when extracting text from the page.
+- `classes_to_remove` defines an (optional) list of HTML "class" types that are ignored when extracting text from the page.
 
 <br>**Note**: when specifying regular expressions it's recommended to use single quotes (as opposed to double quotes) to avoid issues with escape characters.
 
@@ -325,6 +327,34 @@ For this crawler, you need to specify `NOTION_API_KEY` (which is associated with
 The HubSpot crawler has no specific parameters, except the `HUBSPOT_API_KEY` that needs to be specified in the `secrets.toml` file. The crawler will index the emails on your Hubspot instance. The crawler also uses `clean_email_text()` module which takes the email message as a parameter and cleans it to make it more presentable. This function in `core/utils.py` is taking care of indentation character `>`. 
 
 The crawler leverages [Presidio Analyzer and Anonymizer](https://microsoft.github.io/presidio/analyzer/) to accomplish PII masking, achieving a notable degree of accuracy in anonymizing sensitive information with minimal error.
+
+### Google Drive crawler
+
+```yaml
+...
+  gdrive_crawler:
+    permissions: ['Vectara', 'all']
+    days_back: 365
+    ray_workers: 0
+    delegated_users:
+      - ofer@vectara.com
+      - jana@vectara.com
+```
+
+The gdrive crawler indexes content of your Google Drive folder
+- `days_back`: include only files created within the last N days
+- `permissions`: list of `displayName` values to include. We recommend including your company name (e.g. `Vectara`) and `all` to include all non-restricted files.
+- `delegated_users`: list of user emails in your organization. 
+- `ray_workers`: 0 if not using Ray, otherwise specifies the number of Ray workers to use.
+
+This crawler identifies Google Drive files based on the list of delegated users. For each user it looks at those files that the user either created or has access to, but
+limiting only to files that have "accessible by all" permissions (so that "restricted" files are not included)
+
+Note that this crawler uses a Google Drive service account mode to access files, 
+and you need to include a `credentials.json` file in the main vectara-ingest folder.
+For more information see [Google documentation](https://developers.google.com/workspace/guides/create-credentials) under 
+"Service account credentials".
+
 
 ### Folder crawler
 

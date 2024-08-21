@@ -14,7 +14,7 @@ from nbconvert import HTMLExporter      # type: ignore
 import nbformat
 import markdown
 
-from core.utils import html_to_text, detect_language, get_file_size_in_MB, create_session_with_retries, TableSummarizer, mask_pii
+from core.utils import html_to_text, detect_language, get_file_size_in_MB, create_session_with_retries, TableSummarizer, mask_pii, safe_remove_file
 from core.extract import get_article_content
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -73,6 +73,7 @@ class Indexer(object):
     def __init__(self, cfg: OmegaConf, endpoint: str, 
                  customer_id: str, corpus_id: int, api_key: str) -> None:
         self.cfg = cfg
+        self.browser_use_limit = 100
         self.endpoint = endpoint
         self.customer_id = customer_id
         self.corpus_id = corpus_id
@@ -109,6 +110,7 @@ class Indexer(object):
         if use_playwright:
             self.p = sync_playwright().start()
             self.browser = self.p.firefox.launch(headless=True)
+            self.browser_use_count = 0
         self.tmp_file = 'tmp_' + str(uuid.uuid4())
 
     def url_triggers_download(self, url: str) -> bool:
@@ -149,6 +151,7 @@ class Indexer(object):
         page = context = None
         text = ''
         html = ''
+        title = ''
         links = []
         out_url = url
         try:
@@ -218,6 +221,12 @@ class Indexer(object):
                 page.close()
             if context:
                 context.close()
+            self.browser_use_count += 1
+            if self.browser_use_count >= self.browser_use_limit:
+                self.browser.close()
+                self.browser = self.p.firefox.launch(headless=True)
+                self.browser_use_count = 0
+                self.logger.info(f"browser reset after {self.browser_use_limit} uses to avoid memory issues")
             
         return {
             'text': text, 'html': html, 'title': title,
@@ -302,36 +311,38 @@ class Indexer(object):
         Returns:
             bool: True if the upload was successful, False otherwise.
         """
-        if os.path.exists(filename) == False:
+        if not os.path.exists(filename):
             self.logger.error(f"File {filename} does not exist")
             return False
+
+        def get_files(filename: str, metadata: dict):
+            return  {
+                "file": (uri, open(filename, 'rb')),
+                "doc_metadata": (None, json.dumps(metadata)),
+            }  
 
         post_headers = { 
             'x-api-key': self.api_key,
             'customer-id': str(self.customer_id),
             'X-Source': self.x_source
         }
-
-        files: Any = {
-            "file": (uri, open(filename, 'rb')),
-            "doc_metadata": (None, json.dumps(metadata)),
-        }  
         response = self.session.post(
             f"https://{self.endpoint}/upload?c={self.customer_id}&o={self.corpus_id}&d=True",
-            files=files, verify=True, headers=post_headers)
-
+            files=get_files(filename, metadata), verify=True, headers=post_headers
+        )
         if response.status_code == 409:
             if self.reindex:
                 doc_id = response.json()['details'].split('document id')[1].split("'")[1]
                 self.delete_doc(doc_id)
                 response = self.session.post(
                     f"https://{self.endpoint}/upload?c={self.customer_id}&o={self.corpus_id}",
-                    files=files, verify=True, headers=post_headers)
+                    files=get_files(filename, metadata), verify=True, headers=post_headers
+                )
                 if response.status_code == 200:
                     self.logger.info(f"REST upload for {uri} successful (reindex)")
                     return True
                 else:
-                    self.logger.info(f"REST upload for {uri} (reindex) failed with code = {response.status_code}, text = {response.text}")
+                    self.logger.info(f"REST upload for {uri} ({filename}) (reindex) failed with code = {response.status_code}, text = {response.text}")
                     return True
             return False
         elif response.status_code != 200:
@@ -416,7 +427,9 @@ class Indexer(object):
                     for chunk in response.iter_content(chunk_size=8192): 
                         f.write(chunk)
                 self.logger.info(f"File downloaded successfully and saved as {file_path}")
-                return self.index_file(file_path, url, metadata)
+                res =  self.index_file(file_path, url, metadata)
+                safe_remove_file(file_path)
+                return res            
             else:
                 self.logger.info(f"Failed to download file. Status code: {response.status_code}")
                 return False
@@ -434,14 +447,14 @@ class Indexer(object):
                 html_content, _ = exporter.from_notebook_node(nb)
             extracted_title = url.split('/')[-1]      # no title in these files, so using file name
             text = html_to_text(html_content, self.remove_code)
-            parts = [text]            
+            parts = [text]
 
         else:
             try:
                 # Use Playwright to get the page content
                 res = self.fetch_page_contents(url, self.remove_code)
-                text = res['text']
                 html = res['html']
+                text = res['text']
                 extracted_title = res['title']
 
                 if text is None or len(text)<3:
@@ -462,6 +475,8 @@ class Indexer(object):
                     if self.verbose:
                         self.logger.info(f"Removing boilerplate from content of {url}, and extracting important text only")
                     text, extracted_title = get_article_content(html, url, self.detected_language, self.remove_code)
+                else:
+                    text = html_to_text(html, self.remove_code, html_processing)
 
                 parts = [text]
                 self.logger.info(f"retrieving content took {time.time()-st:.2f} seconds")
