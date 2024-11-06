@@ -70,7 +70,7 @@ Note that ray with docker does not work on Mac M1/M2 machines.
 ...
 database_crawler:
     db_url: "postgresql://<username>:<password>@my_db_host:5432/yelp"
-    db_table: yelp_reviews                                 
+    db_table: yelp_reviews
     select_condition: "city='New Orleans'"
     doc_id_columns: [postal_code]
     text_columns: [business_name, review_text]
@@ -102,6 +102,7 @@ hfdataset_crawler:
     dataset_name: "coeuslearning/hotel_reviews"
     split: "train"
     select_condition: "city='New York City, USA'"
+    start_row: 0
     num_rows: 55
     title_column: hotel
     text_columns: [review]
@@ -111,6 +112,7 @@ The database crawler can be used to read data from a relational database and ind
 - `dataset_name` the huggingface dataset name
 - `split` the "split" of the dataset in the HF datasets hub (e.g. "train", or "test", or "corpus"; look at DS card to determine)
 - `select_condition` optional condition to filter rows in the table by
+- `start_row` if specified skips the specified number of rows from the start of the dataset
 - `num_rows` if specified limits the dataset size by number of specified rows
 - `id_column` optional column for the ID of the dataset. Must be unique if used
 - `text_columns` a list of column names that include textual information we want to use as the main text indexed into vectara. The code concatenates these columns for each row.
@@ -128,9 +130,11 @@ In the above example, the crawler would
 ...
 csv_crawler:
     file_path: "/path/to/Game_of_Thrones_Script.csv"
+    select_condition: "Season='Season 1'"
     doc_id_columns: [Season, Episode]
     text_columns: [Name, Sentence]
     metadata_columns: ["Season", "Episode", "Episode Title"]
+    column_types: []
     separator: ','
     sheet_name: "my-sheet"
 ```
@@ -140,6 +144,7 @@ The csv crawler is similar to the database crawler, but instead of pulling data 
 - `text_columns` a list of column names that include textual information we want to use 
 - `title_column` is an optional column name that will hold textual information to be used as title
 - `metadata_columns` a list of column names that we want to use as metadata
+- `column_types` an optional dictionary of column name and type (int, float, str). If unspecified, or for columns not included, the default type is str.
 - `separator` a string that will be used as a separator in the CSV file (default ',') (relevant only for CSV files)
 - `sheet_name` the name of the sheet in the XLSX file to use (relevant only for XLSX files)
 
@@ -304,6 +309,24 @@ The JIRA crawler indexes issues and comments into Vectara.
 - `jira_base_url`: the Jira base_url
 - `jira_username`: the user name that the crawler should use (`JIRA_PASSWORD` should be separately defined in the `secrets.toml` file)
 - `jira_jql`: a Jira JQL condition on the issues identified; in this example it is configured to only include items from the last year.
+
+### Twitter crawler
+
+```yaml
+...
+  twitter_crawler:
+    bearer_token: the Twitter API bearer token. see https://developer.twitter.com/en/docs/twitter-api/getting-started/getting-access-to-the-twitter-api'
+    userhandles: a list of user handles to pull tweets from
+    num_tweets: number of most recent tweets to pull from each user handle
+    clean_tweets: whether to remove username / handles from tweet text (default: True)
+```
+
+The twitter crawler indexes top `num_tweeets` mentions from twitter
+- `bearer_token`: the Twitter developer authentication token
+- `userhandles`: a list of user handles to look for in mentions
+- `num_tweets`: number of recent tweets mentioning each handle to pull
+- `clean_tweets` if True removes all username/handle
+
 
 ### Notion crawler
 
