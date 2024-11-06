@@ -1,0 +1,17 @@
+vectara:
+  corpus_id: 4
+  customer_id: 4077139778
+  remove_boilerplate: true
+
+crawling:
+  crawler_type: website
+
+website_crawler:
+  urls: [https://care.qumulo.com]
+  pos_regex: ["https://care.qumulo.com/.*"]
+  pages_source: crawl
+  extraction: playwright
+  delay: 1
+  max_depth: 3
+  ray_workers: 2
+  remove_old_content: true
