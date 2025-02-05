@@ -1,0 +1,28 @@
+# v.4.0-222127225
+
+vectara:
+  corpus_key: Qumulo_Main_5
+  customer_id: 4077139778
+  reindex: true
+  remove_boilerplate: true
+
+crawling:
+  crawler_type: website
+
+website_crawler:
+  urls: [https://qumulo.com]
+  pos_regex: [".*qumulo.*"]
+  neg_regex: [".*care.qumulo.*"]
+  pages_source: sitemap
+  extraction: playwright
+  delay: 1
+  max_depth: 2
+  ray_workers: 40
+  remove_old_content: true
+  html_processing:
+    ids_to_remove: []
+    classes_to_remove: []
+    tags_to_remove: []
+
+doc_processing:
+  summarize_tables: false

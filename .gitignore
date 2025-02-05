@@ -119,7 +119,7 @@ venv.bak/
 secrets.toml
 
 # Custom configuration files
-config/qumulo-*.yaml
+#config/qumulo-*.yaml
 
 # Any GDrive credentials file
 credentials.json

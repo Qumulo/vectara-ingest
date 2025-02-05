@@ -1,0 +1,28 @@
+# v.5.0-423124225
+
+vectara:
+  corpus_key: Qumulo_Documentation_Portal_2
+  customer_id: 4077139778
+  reindex: true
+  remove_boilerplate: true
+
+crawling:
+  crawler_type: website
+
+website_crawler:
+  urls: [https://docs.qumulo.com]
+  pos_regex: [".*docs.qumulo.*"]
+  neg_regex: ['https:\/\/docs\.qumulo\.com\/[a-zA-Z0-9\-]+\/[a-zA-Z0-9\-]+\/index\.html','https:\/\/docs\.qumulo\.com\/[a-zA-Z0-9\-]+\/index\.html']
+  pages_source: sitemap
+  extraction: playwright
+  delay: 1
+  max_depth: 2
+  ray_workers: 40
+  remove_old_content: true
+  html_processing:
+    ids_to_remove: [tg-sb-sidebar,toc,cookie-banner]
+    classes_to_remove: [header-container,below-header,breadcrumb-line,footer]
+    #tags_to_remove: [bar]
+
+doc_processing:
+  summarize_tables: false
