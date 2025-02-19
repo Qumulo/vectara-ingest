@@ -1,4 +1,4 @@
-# v.5.1-12125225
+# v.5.2-1134219225
 
 vectara:
   corpus_key: Qumulo_Care_4
@@ -14,6 +14,7 @@ website_crawler:
   #neg_regex: ["^https://care\.qumulo\.com/s/$"]
   pages_source: crawl
   extraction: playwright
+  keep_query_params: true
   delay: 1
   max_depth: 2
   ray_workers: 40
