@@ -163,9 +163,10 @@ def main() -> None:
         logging.error(f"Error loading config file ({config_name}): {e}")
         return
 
+    secrets_path = os.environ.get('VECTARA_SECRETS_PATH', '/home/vectara/env/secrets.toml')
     # add .env params, by profile
-    volume = '/home/vectara/env'
-    with open(f"{volume}/secrets.toml", "r") as f:
+    logging.info(f"Loading {secrets_path}")
+    with open(secrets_path, "r") as f:
         env_dict = toml.load(f)
     if profile_name not in env_dict:
         logging.info(f'Profile "{profile_name}" not found in secrets.toml')
@@ -203,6 +204,12 @@ def main() -> None:
             continue
         if k=='CONFLUENCE_USERNAME':
             OmegaConf.update(cfg, f'confluence_crawler.{k.lower()}', v)
+            continue
+        if k=='SERVICENOW_PASSWORD':
+            OmegaConf.update(cfg, f'servicenow_crawler.{k.lower()}', v)
+            continue
+        if k=='SERVICENOW_USERNAME':
+            OmegaConf.update(cfg, f'servicenow_crawler.{k.lower()}', v)
             continue
         if k=='GITHUB_TOKEN':
             OmegaConf.update(cfg, f'github_crawler.{k.lower()}', v)
