@@ -117,6 +117,8 @@ venv.bak/
 
 # Secrets file in TOML format
 secrets.toml
+# certificate authority file
+ca.pem
 
 # Custom configuration files
 #config/qumulo-*.yaml

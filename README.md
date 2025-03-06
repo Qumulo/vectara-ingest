@@ -98,6 +98,14 @@ For our example we would index the content of https://www.paulgraham.com website
       
    4. Change `rss_crawler.days_past` to `365`.
 
+6. If Vectara is installed in your datacenter, and you are using an internal certificate authority. 
+   1. Write the entire certificate chain to `ca.pem`.
+   2. Update your crawler config to include the following.
+      ```yaml
+      vectara:
+         ssl_verify: /home/vectara/env/ca.pem
+      ```
+
 ## Step 3: Run the crawler
 
 1. Ensure that Docker is running on your local machine.
@@ -112,7 +120,7 @@ For our example we would index the content of https://www.paulgraham.com website
    * On Linux, ensure that the `run.sh` file is executable by running the following command:
   
      ```bash
-     cmhod +x run.sh
+     chmod +x run.sh
      ```
 
    * On Windows, ensure that you run this command from within the WSL 2 environment.
@@ -166,6 +174,12 @@ Each configuration YAML file includes a set of standard variables, for example:
 
 ```yaml
 vectara:
+  # endpoint for Vectara platform
+  endpoint: api.vectara.io
+
+  # authentication URL for OAuth (when using create_corpus)
+  auth_url: auth.vectara.io
+
   # the corpus key for indexing
   corpus_key: my-corpus
   
@@ -204,6 +218,11 @@ vectara:
   # Which whisper model to use for audio files (relevant for YT, S3 and folder crawlers)
   # Valid values: tiny, base, small, medium or large. Defaults to base.
   whisper_model: the model name for whisper
+  # Whether the session should trust the environment settings. When set to False SSL will not be verified. Do not use in production.
+  ssl_verify: None  
+  # If `False`, SSL verification is disabled (not recommended for production). 
+  # If a string, it is treated as the path to a custom CA certificate file. 
+  # If `True` or not provided, default SSL verification is used.
 
 
 doc_processing:
@@ -228,6 +247,9 @@ doc_processing:
   # use GMFT to parse tables from PDF
   enable_gmft: true
 
+  # use OCR when parsing documents (Docling only)
+  do_ocr: true
+
   # Whether or not to summarize image content using GPT-4o vision 
   # When using this feature, you need to list the OPENAI_API_KEY or ANTHRPIC_API_KEY in your `secrets.toml` 
   # under a special profile called `general`.
@@ -242,6 +264,7 @@ doc_processing:
   # Docling document parsing configuation
   docling_config:
     chunking_strategy: hybrid          # chunking strategy to use: hierarchical, hybrid or none (default hybrid)
+    image_scale: 1.0                   # set to 2.0 for larger resolution in diagrams. 1.0 is equivalent to 72 DPI
 
   # whether to use core_indexing which maintains the chunks from unstructured or docling, or let vectara chunk further
   use_core_indexing: false            
