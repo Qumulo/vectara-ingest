@@ -1,4 +1,4 @@
-# v.4.0-222127225
+# v.4.1-22136225
 
 vectara:
   corpus_key: Qumulo_Main_5
@@ -11,14 +11,18 @@ crawling:
 
 website_crawler:
   urls: [https://qumulo.com]
-  pos_regex: [".*qumulo.*"]
+  pos_regex: [".*qumulo.com/blog.*"]
   neg_regex: [".*care.qumulo.*"]
-  pages_source: sitemap
+  #pages_source: sitemap
+  pages_source: crawl
   extraction: playwright
   delay: 1
   max_depth: 2
   ray_workers: 40
-  remove_old_content: true
+  crawl_report: true
+  #timeout: 2
+  #post_load_timeout: 2
+  #remove_old_content: true
   html_processing:
     ids_to_remove: []
     classes_to_remove: []
