@@ -1,10 +1,10 @@
-# v.5.4-64937225
+# v.5.5-1239321225
 
 vectara:
   corpus_key: Qumulo_Care_4
   customer_id: 4077139778
-  remove_boilerplate: true
   reindex: true
+  remove_boilerplate: true
 
 crawling:
   crawler_type: website
@@ -12,16 +12,16 @@ crawling:
 website_crawler:
   urls: [https://care.qumulo.com]
   pos_regex: ["https://care.qumulo.com/.*"]
-  #neg_regex: ["^https://care\.qumulo\.com/s/$"]
+ #neg_regex: [""]
   pages_source: crawl
   extraction: playwright
   keep_query_params: true
   delay: 1
   max_depth: 2
-  crawl_report: true
-  timeout: 30
-  post_load_timeout: 30
-  #ray_workers: 40
+ #crawl_report: true
+ #timeout: 30
+ #post_load_timeout: 30
+  ray_workers: 40
   remove_old_content: true
   html_processing:
     ids_to_remove: []
