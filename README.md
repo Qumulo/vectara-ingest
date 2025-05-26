@@ -98,8 +98,8 @@ For our example we would index the content of https://www.paulgraham.com website
       
    4. Change `rss_crawler.days_past` to `365`.
 
-6. If Vectara is installed in your datacenter, and you are using an internal certificate authority. 
-   1. Write the entire certificate chain to `ca.pem`.
+6. If Vectara is installed in your datacenter, and you are using an internal certificate authority:
+   1. Write the entire certificate chain to `ca.pem` in the main `vectara-ingest` folder.
    2. Update your crawler config to include the following.
       ```yaml
       vectara:
@@ -189,6 +189,10 @@ vectara:
   # the corpus key for indexing
   corpus_key: my-corpus
   
+  # Chunking strategy
+  chunking_strategy: sentence   # sentence or fixed
+  chunk_size: 512               # only applies for "fixed" strategy
+
   # flag: should vectara-ingest reindex if document already exists (optional)
   reindex: false
 
@@ -235,8 +239,10 @@ doc_processing:
   # which model to use for text processing (table summary, contextual chunking or data extraction), and for image processing.
   # - provider can be "openai" or "anthropic" or "private". default is "openai"
   # - base_url is an optional URL pointing to a privately-hosted URL for model serving
-  #   If you host the private endpoint locally, note that you would need to provide access to it from within the Docker image
-  #   For example: "http://host.docker.internal:5000/v1"
+  #   1) If you host the private endpoint locally (on your laptop), note that you would need to provide access 
+  #      to it from within the Docker image. For example: "http://host.docker.internal:5000/v1"
+  #   2) If your private API requires an api_key (recommended) then include PRIVATE_API_KEY in your secrets.toml
+  #      file under the `general` profile (same place you would include your `OPENAI_API_KEY`)
   # - model_name is the model name to use for each type of processing (table, vision or contextual)
   #
   # For backwards compatibility, if you specify the "model" argument, then the same
@@ -325,6 +331,7 @@ We use a `secrets.toml` file to hold secret keys and parameters. You need to cre
 [general]
 OPENAI_API_KEY="sk-..."
 ANTHROPIC_API_KEY="sk-..."
+PRIVATE_API_KEY="YOUR-PRIVATE-API_KEY"
 
 [profile1]
 api_key="<VECTAR-API-KEY-1>"
@@ -344,6 +351,15 @@ Many of the crawlers have their own secrets, for example Notion, Discourse, Jira
 If you are using the table summarization, image summarization or contextual retreival features, 
 you have to provide your own LLM key (either OPENAI_API_KEY or ANTHROPIC_API_KEY). 
 In this case, you would need to put that key under the `[general]` profile. This is a special profile name reserved for this purpose.
+
+### Adding Custom CA Certificates
+
+This container supports adding custom CA certificates at runtime. When using `./run.sh` if a ssl directory exists, 
+it will be mounted to the container as `./ssl:/ssl:ro`. Within the container
+if a `/ssl` directory exists and contains `.crt` files, the container will:
+
+1. Copy them into the system certificate store at `/usr/local/share/ca-certificates/`
+2. Run `update-ca-certificates` to install them
 
 ### Indexer Class
 

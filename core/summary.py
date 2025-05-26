@@ -1,4 +1,5 @@
 from typing import Set
+import os
 import json
 import base64
 import logging
@@ -6,6 +7,7 @@ from omegaconf import OmegaConf
 
 from PIL import Image
 from io import BytesIO
+import cairosvg
 
 from core.models import generate, generate_image_summary
 
@@ -13,10 +15,13 @@ def _get_image_shape(content: str) -> tuple:
     """
     Given a base64-encoded image content string, return the image shape as (width, height).
     """
-    img_data = base64.b64decode(content)
-    img = Image.open(BytesIO(img_data))
-    return img.size  # (width, height)
-
+    try:
+        img_data = base64.b64decode(content)
+        img = Image.open(BytesIO(img_data))
+        return img.size  # (width, height)
+    except (IOError, OSError, ValueError) as e:
+        logging.info(f"Skipping summarization: not a valid image ({e})")
+        return None
 
 def get_attributes_from_text(cfg: OmegaConf, text: str, metadata_questions: list[dict], model_config: dict) -> Set[str]:
     """
@@ -33,6 +38,7 @@ def get_attributes_from_text(cfg: OmegaConf, text: str, metadata_questions: list
     prompt += "Your task is retrieve the value of each attribute by answering the provided question, based on the text."
     prompt += "Your response should be as concise and accurate as possible. Prioritize 1-2 word responses."
     prompt += "Your response should be as a dictionary of attribute/value pairs in JSON format, and include only the JSON output without any additional text."
+    logging.info(f"get_attributes_from_text() - Calling generate")
     res = generate(cfg, system_prompt, prompt, model_config)
     if res.strip().startswith("```json"):
         res = res.strip().removeprefix("```json").removesuffix("```")
@@ -43,12 +49,36 @@ class ImageSummarizer():
         self.image_model_config = image_model_config
         self.cfg = cfg
 
-    def summarize_image(self, image_path: str, image_url: str, previous_text: str = None):
+    def get_image_content_for_summarization(self, image_path: str):
+        
+        orig_image_path = image_path
+        if orig_image_path.lower().endswith(".svg"):
+            logging.info(f"Converting svg image ({image_path}) to png for summarization")
+            new_image_path = image_path.replace(".svg", ".png")
+            cairosvg.svg2png(url=image_path, write_to=new_image_path, dpi=300)
+            image_path = new_image_path
+
         content = None
         with open(image_path, "rb") as f:
             content = base64.b64encode(f.read()).decode("utf-8")
-        
-        width, height = _get_image_shape(content)
+
+        if orig_image_path.lower().endswith(".svg"):
+            try:
+                os.remove(orig_image_path)
+            except FileNotFoundError:
+                logging.warning(f"File '{orig_image_path}' not found.")
+            except Exception as e:
+                logging.warning(f"An error occurred: {e}")
+
+        return content
+
+    def summarize_image(self, image_path: str, image_url: str, previous_text: str = None):
+        content = self.get_image_content_for_summarization(image_path)        
+        shape = _get_image_shape(content)
+        if not shape:
+             logging.info(f"Image too small to summarize ({image_url})")
+             return None
+        width, height = shape
         if width<10 or height<10:
             logging.info(f"Image too small to summarize ({image_url})")
             return None
@@ -86,6 +116,7 @@ class TableSummarizer():
             Make sure your summary is concise, informative and comprehensive.
             Use clear and professional language, ensuring all descriptions are tied explicitly to the data.
             Your response should be without headings, and in text (not markdown).
+            Your response should include contextual information, so that it is identified as relevant in search results.
             Review your response for accuracy, coherence, and no hallucinations.
             Here is the table: {text}
         """

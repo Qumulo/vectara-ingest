@@ -2,6 +2,8 @@ import os
 import re
 import sys
 import requests
+from requests.adapters import HTTPAdapter
+from requests.models import Response, PreparedRequest
 from typing import List, Set, Any, Dict
 
 from urllib3.util.retry import Retry
@@ -40,10 +42,14 @@ archive_extensions = [".zip", ".gz", ".tar", ".bz2", ".7z", ".rar"]
 binary_extensions = archive_extensions + img_extensions + doc_extensions
 
 def setup_logging():
+    log_level_str = os.getenv("LOGGING_LEVEL", "INFO").upper()
+
+    # Map string to logging level, fallback to INFO if invalid
+    log_level = getattr(logging, log_level_str, logging.INFO)
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
+    root.setLevel(log_level)
     handler = logging.StreamHandler(sys.stdout)
-    handler.setLevel(logging.INFO)
+    handler.setLevel(log_level)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     handler.setFormatter(formatter)
     root.addHandler(handler)
@@ -108,6 +114,7 @@ def html_to_text(html: str, remove_code: bool = False, html_processing: dict = {
 
     # Remove code blocks if specified
     if remove_code:
+        logging.info("Removing code blocks from HTML")
         html = remove_code_from_html(html)
 
     # Initialize BeautifulSoup
@@ -144,6 +151,29 @@ def safe_remove_file(file_path: str):
     except Exception as e:
         logging.info(f"Failed to remove file: {file_path} due to {e}")
 
+
+class LoggingAdapter(HTTPAdapter):
+    def send(self, request: PreparedRequest, **kwargs) -> Response:
+        response = super().send(request, **kwargs)
+
+        log_message = f"""
+=== HTTP Request & Response ===
+> {request.method} {request.url}
+> Headers:
+{request.headers}
+> Body:
+{request.body if request.body else '<empty>'}
+
+< Status: {response.status_code}
+< Headers:
+{response.headers}
+< Body (truncated to 500 chars):
+{response.text[:500]}
+===============================
+"""
+        logging.debug(log_message)
+        return response
+
 def create_session_with_retries(retries: int = 5) -> requests.Session:
     """Create a requests session with retries."""
     session = requests.Session()
@@ -151,10 +181,13 @@ def create_session_with_retries(retries: int = 5) -> requests.Session:
         total=retries,
         status_forcelist=[429, 430, 443, 500, 502, 503, 504],  # A set of integer HTTP status codes that we should force a retry on.
         backoff_factor=1,
+        raise_on_status=False,
+        respect_retry_after_header=True,
+        allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
     )
-    adapter = requests.adapters.HTTPAdapter(max_retries=retry_strategy)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
+    logging_adapter = LoggingAdapter(max_retries=retry_strategy)
+    session.mount('http://', logging_adapter)
+    session.mount('https://', logging_adapter)
     return session
 
 def configure_session_for_ssl(session: requests.Session, config: DictConfig) -> None:
@@ -471,18 +504,12 @@ def markdown_to_df(markdown_table):
 def create_row_items(items: List[Any]) -> List[Dict[str, Any]]:
     res = []
     for item in items:
-        if isinstance(item, str):
-            res.append({'text_value': item})
-        elif isinstance(item, int):
-            res.append({'int_value': item})
-        elif isinstance(item, float):
-            res.append({'float_value': item})
-        elif isinstance(item, bool):
-            res.append({'bool_value': item})
-        elif isinstance(item, tuple):   # Tuple of (colname, colspan)
+        if isinstance(item, tuple):   # Tuple of (colname, colspan)
             val = '' if pd.isnull(item[0]) else item[0]
             extra_colspan = item[1] - 1
             res.extend([{'text_value': val}] + [{'text_value':''} for _ in range(extra_colspan)])
+        elif isinstance(item, str) or isinstance(item, int) or isinstance(item, float) or isinstance(item, bool):
+            res.append({'text_value': str(item)})
         else:
             logging.info(f"Create_row_items: unsupported type {type(item)} for item {item}")
     return res
@@ -580,6 +607,7 @@ def html_table_to_header_and_rows(html):
     # First row is the "header"
     header = matrix[0]
     rows = matrix[1:]
+
     return header, rows
 
 def get_media_type_from_base64(base64_data: str) -> str:

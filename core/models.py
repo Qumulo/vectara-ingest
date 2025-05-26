@@ -15,7 +15,7 @@ def get_api_key(provider: str, cfg: OmegaConf) -> str:
     elif provider == 'private':
         return cfg.vectara.get("private_api_key", None)
     else:
-        logging.info(f"Unsupported provider: {provider}")
+        logging.info(f"Unsupported LLM provider: {provider}")
         return None
 
 def generate(
@@ -28,6 +28,9 @@ def generate(
     """
     Given a prompt, generate text using the specified model.
     """
+    logging.debug(f"generate() - model_config: {model_config}")
+    logging.debug(f"generate() - system_prompt: {system_prompt}")
+    logging.debug(f"generate() - user_prompt: {user_prompt}")
     provider = model_config.get('provider', 'openai')
     model_api_key = get_api_key(provider, cfg)
     if provider == 'openai' or provider=='private':
@@ -145,6 +148,6 @@ def generate_image_summary(
         summary = str(response.content[0].text)
         return summary
     
-    logging.info(f"Unsupported provider: {provider}")
+    logging.info(f"Unsupported vision LLM provider: {provider}")
 
 

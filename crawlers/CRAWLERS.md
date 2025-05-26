@@ -24,7 +24,8 @@ website_crawler:
     neg_regex: []
     num_per_second: 10
     pages_source: crawl
-    max_depth: 3      # only needed if pages_source is set to 'crawl'
+    crawl_method: internal  # "internal" (default) or "scrapy"
+    max_depth: 3            # only needed if pages_source is set to 'crawl'
     html_processing:
       ids_to_remove: [td-123]
       tags_to_remove: [nav]
@@ -213,6 +214,7 @@ The hackernews crawler can be used to crawl stories and comments from hacker new
     num_per_second: 10
     extensions_to_ignore: [".php", ".java", ".py", ".js"]
     docs_system: docusaurus
+    crawl_method: internal  # "internal" (default) or "scrapy"
     remove_code: true
     html_processing:
       ids_to_remove: []
@@ -238,6 +240,7 @@ If `crawl_report` is true then the list of URLs associated with the removed docu
 The `html_processing` configuration defines a set of special instructions that can be used to ignore some content when extracting text from HTML:
 - `ids_to_remove` defines an (optional) list of HTML IDs that are ignored when extracting text from the page.
 - `tags_to_remove` defines an (optional) list of HTML semantic tags (like header, footer, nav, etc) that are ignored when extracting text from the page.
+- `classes_to_remove` defines an (optional) list of CSS class names that are ignored when extracting text from the page.
 - `ssl_verify`  If `False`, SSL verification is disabled (not recommended for production). If a string, it is treated as the path to a custom CA certificate file. If `True` or not provided, default SSL verification is used.
 - 
 <br>**Note**: when specifying regular expressions it's recommended to use single quotes (as opposed to double quotes) to avoid issues with escape characters.

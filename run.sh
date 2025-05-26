@@ -24,14 +24,6 @@ fi
 crawler_type=`python3 -c "import yaml; print(yaml.safe_load(open('$1'))['crawling']['crawler_type'])" | tr '[:upper:]' '[:lower:]'`
 
 # Mount secrets file and other files as needed into docker container
-mkdir -p ~/tmp/mount
-[ -f secrets.toml ] && cp secrets.toml ~/tmp/mount
-[ -f ca.pem ] && cp ca.pem ~/tmp/mount
-cp "$1" ~/tmp/mount/
-
-if [[ "$crawler_type" == "gdrive" ]]; then
-  [ -f credentials.json ] && cp credentials.json ~/tmp/mount
-fi
 
 # Build docker container
 ARCH=$(uname -m)
@@ -71,8 +63,64 @@ else
   exit 4
 fi
 
+make_absolute() {
+  local path="$1"
+  if [[ "$path" = /* ]]; then
+    echo "$path"
+  else
+    echo "$(pwd)/$path"
+  fi
+}
+
+sanitize_for_docker_name() {
+  local filename="$1"
+  local base=$(basename "$filename")     # Remove path
+  base=$(echo "$base" | tr '[:upper:]' '[:lower:]')  # Lowercase
+  base="${base%%.*}"                     # Remove extension
+
+  # Replace invalid characters with underscore
+  base=$(echo "$base" | sed 's/[^a-z0-9_-]/_/g')
+
+  # Remove leading dashes
+  base=$(echo "$base" | sed 's/^-*//')
+
+  # Trim to 255 characters (Docker max)
+  echo "${base:0:255}"
+}
+
+ABSOLUTE_CONFIG_PATH=`make_absolute $1`
+CONFIG_NAME=`basename $1`
+CONTAINER_NAME_SUFFIX=`sanitize_for_docker_name $1`
+CONTAINER_NAME="vingest-${CONTAINER_NAME_SUFFIX}"
+
 # remove old container if it exists
-docker container inspect vingest &>/dev/null && docker rm -f vingest
+docker container inspect "${CONTAINER_NAME}" &>/dev/null && docker rm -f "${CONTAINER_NAME}"
+ADDITIONAL_DOCKER_FLAGS="${ADDITIONAL_DOCKER_FLAGS} -v ${ABSOLUTE_CONFIG_PATH}:/home/vectara/env/${CONFIG_NAME}:ro"
+
+if [[ -f secrets.toml ]]; then
+  ADDITIONAL_DOCKER_FLAGS="${ADDITIONAL_DOCKER_FLAGS} -v ./secrets.toml:/home/vectara/env/secrets.toml:ro"
+else
+  echo "secrets.toml not found. Exiting"
+  exit 1
+fi
+
+if [[ -f ca.pem ]]; then
+  ADDITIONAL_DOCKER_FLAGS="${ADDITIONAL_DOCKER_FLAGS} -v ./ca.pem:/home/vectara/env/ca.pem:ro"
+fi
+
+if [[ -d ssl ]]; then
+  ADDITIONAL_DOCKER_FLAGS="${ADDITIONAL_DOCKER_FLAGS} -v ./ssl:/ssl:ro"
+fi
+
+if [[ "$crawler_type" == "gdrive" ]]; then
+  if [[ -f credentials.json ]]; then
+    ADDITIONAL_DOCKER_FLAGS="${ADDITIONAL_DOCKER_FLAGS} -v ./credentials.json:/home/vectara/env/credentials.json:ro"
+  fi
+fi
+
+if [[ -n "${LOGGING_LEVEL}" ]]; then
+  ADDITIONAL_DOCKER_FLAGS="${ADDITIONAL_DOCKER_FLAGS} -e LOGGING_LEVEL=${LOGGING_LEVEL}"
+fi
 
 # Run docker container
 config_file_name="${1##*/}"
@@ -82,8 +130,9 @@ if [[ "${crawler_type}" == "folder" ]]; then
     if [ ! -d "$folder" ]; then
         echo "Error: Folder '$folder' does not exist."
         exit 6
-    fi    
-    docker run -d -v ~/tmp/mount:/home/vectara/env -v "$folder:/home/vectara/data" -e CONFIG=/home/vectara/env/$config_file_name -e PROFILE=$2 --name vingest $tag
+    fi
+    ADDITIONAL_DOCKER_FLAGS="${ADDITIONAL_DOCKER_FLAGS} -v $folder:/home/vectara/data"
+
 elif [[ "$crawler_type" == "csv" ]]; then
     # special handling of "csv crawler" where we need to mount the csv file under /home/vectara/data
     file_path=`python3 -c "import yaml; print(yaml.safe_load(open('$1'))['csv_crawler']['file_path'])"`
@@ -91,22 +140,26 @@ elif [[ "$crawler_type" == "csv" ]]; then
         echo "Error: CSV file '$file_path' does not exist."
         exit 5
     fi
-    docker run -d -v ~/tmp/mount:/home/vectara/env -v "$file_path:/home/vectara/data/file" -e CONFIG=/home/vectara/env/$config_file_name -e PROFILE=$2 --name vingest $tag
+    ADDITIONAL_DOCKER_FLAGS="${ADDITIONAL_DOCKER_FLAGS} -v $file_path:/home/vectara/data/file"
+
 elif [[ "$crawler_type" == "bulkupload" ]]; then
     # special handling of "bulkupload crawler" where we need to mount the JSON file under /home/vectara/data
     json_path=`python3 -c "import yaml; print(yaml.safe_load(open('$1'))['bulkupload_crawler']['json_path'])"`
     if [ ! -f "$file_path" ]; then
         echo "Error: CSV file '$json_path' does not exist."
         exit 5
-    fi    
-    docker run -d -v ~/tmp/mount:/home/vectara/env -v "$json_path:/home/vectara/data/file.json" -e CONFIG=/home/vectara/env/$config_file_name -e PROFILE=$2 --name vingest $tag
-else
-    docker run -d -v ~/tmp/mount:/home/vectara/env -e CONFIG=/home/vectara/env/$config_file_name -e PROFILE=$2 --name vingest $tag
+    fi
+    ADDITIONAL_DOCKER_FLAGS="${ADDITIONAL_DOCKER_FLAGS} -v $json_path:/home/vectara/data/file.json"
 fi
+ADDITIONAL_DOCKER_FLAGS="${ADDITIONAL_DOCKER_FLAGS} -e CONFIG=/home/vectara/env/$config_file_name"
+
+
+echo Running docker: docker run -d ${ADDITIONAL_DOCKER_FLAGS} -e PROFILE=$2 --name "${CONTAINER_NAME}" $tag
+docker run -d ${ADDITIONAL_DOCKER_FLAGS} -e PROFILE=$2 --name "${CONTAINER_NAME}" $tag
 
 if [ $? -eq 0 ]; then
   echo "Success! Ingest job is running."
-  echo "You can try 'docker logs -f vingest' to see the progress."
+  echo "You can try 'docker logs -f ${CONTAINER_NAME}' to see the progress."
 else
   echo "Ingest container failed to start. Please check the messages above."
 fi
