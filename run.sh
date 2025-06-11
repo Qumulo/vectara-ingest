@@ -20,6 +20,9 @@ if [ ! -f secrets.toml ]; then
   exit 3
 fi
 
+RED='\033[0;31m'
+NC='\033[0m'
+
 # retrieve the crawler type from the config file
 crawler_type=`python3 -c "import yaml; print(yaml.safe_load(open('$1'))['crawling']['crawler_type'])" | tr '[:upper:]' '[:lower:]'`
 
@@ -43,6 +46,19 @@ else
   echo "Building for $ARCH"
 fi
 
+BUILD_ARGS=""
+
+if [[ -n "${http_proxy}" ]]; then
+  BUILD_ARGS="$BUILD_ARGS --build-arg HTTP_PROXY=\"${http_proxy}\""
+fi
+if [[ -n "${https_proxy}" ]]; then
+  BUILD_ARGS="$BUILD_ARGS --build-arg HTTPS_PROXY=\"${https_proxy}\""
+fi
+if [[ -n "${no_proxy}" ]]; then
+  BUILD_ARGS="$BUILD_ARGS --build-arg NO_PROXY=\"${no_proxy}\""
+fi
+
+
 sum_tables=`python3 -c "import yaml; print(yaml.safe_load(open('$1')).get('doc_processing', {}).get('summarize_tables', ''))" | tr '[:upper:]' '[:lower:]'`
 sum_images=`python3 -c "import yaml; print(yaml.safe_load(open('$1')).get('doc_processing', {}).get('summarize_images', ''))" | tr '[:upper:]' '[:lower:]'`
 mask_pii=`python3 -c "import yaml; print(yaml.safe_load(open('$1'))['vectara'].get('mask_pii', 'false'))" | tr '[:upper:]' '[:lower:]'`
@@ -50,10 +66,12 @@ mask_pii=`python3 -c "import yaml; print(yaml.safe_load(open('$1'))['vectara'].g
 if [[ "$sum_tables" == "true" || $"sum_images" == "true" || "$mask_pii" == "true" ]]; then
     echo "Building with extra features"
     tag="vectara-ingest-full"
-    docker $BUILD_CMD --build-arg INSTALL_EXTRA="true" --platform linux/$ARCH . --tag="$tag:latest"
+    echo "docker $BUILD_CMD $BUILD_ARGS --build-arg INSTALL_EXTRA=\"true\" --platform linux/$ARCH . --tag=\"$tag:latest\""
+    docker $BUILD_CMD $BUILD_ARGS --build-arg INSTALL_EXTRA="true" --platform linux/$ARCH . --tag="$tag:latest"
 else
   tag="vectara-ingest"
-  docker $BUILD_CMD --build-arg INSTALL_EXTRA="false" --platform linux/$ARCH . --tag="$tag:latest"
+  echo "docker $BUILD_CMD $BUILD_ARGS --build-arg INSTALL_EXTRA=\"false\" --platform linux/$ARCH . --tag=\"$tag:latest\""
+  docker $BUILD_CMD $BUILD_ARGS --build-arg INSTALL_EXTRA="false" --platform linux/$ARCH . --tag="$tag:latest"
 fi
 
 if [ $? -eq 0 ]; then
@@ -145,8 +163,8 @@ elif [[ "$crawler_type" == "csv" ]]; then
 elif [[ "$crawler_type" == "bulkupload" ]]; then
     # special handling of "bulkupload crawler" where we need to mount the JSON file under /home/vectara/data
     json_path=`python3 -c "import yaml; print(yaml.safe_load(open('$1'))['bulkupload_crawler']['json_path'])"`
-    if [ ! -f "$file_path" ]; then
-        echo "Error: CSV file '$json_path' does not exist."
+    if [ ! -f "$json_path" ]; then
+        echo "Error: JSON file '$json_path' does not exist."
         exit 5
     fi
     ADDITIONAL_DOCKER_FLAGS="${ADDITIONAL_DOCKER_FLAGS} -v $json_path:/home/vectara/data/file.json"
@@ -159,7 +177,7 @@ docker run -d ${ADDITIONAL_DOCKER_FLAGS} -e PROFILE=$2 --name "${CONTAINER_NAME}
 
 if [ $? -eq 0 ]; then
   echo "Success! Ingest job is running."
-  echo "You can try 'docker logs -f ${CONTAINER_NAME}' to see the progress."
+  echo -e "You can try ${RED}'docker logs -f ${CONTAINER_NAME}'${NC} to see the progress."
 else
   echo "Ingest container failed to start. Please check the messages above."
 fi

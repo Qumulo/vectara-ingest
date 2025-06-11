@@ -120,11 +120,18 @@ secrets.toml
 # certificate authority file
 ca.pem
 
+<<<<<<< HEAD
 # Custom configuration files
 #config/qumulo-*.yaml
 
 # Any GDrive credentials file
+=======
+# GDrive credentials file
+>>>>>>> main
 credentials.json
+
+# Temporary directory for crawler output files
+temp/
 
 # Spyder project settings
 .spyderproject

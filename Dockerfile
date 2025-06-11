@@ -1,6 +1,14 @@
 # Stage 1: Build stage
 FROM python:3.11-slim AS builder
 
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
+ENV http_proxy=$HTTP_PROXY
+ENV https_proxy=$HTTPS_PROXY
+ENV no_proxy=$NO_PROXY
+
 ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/home/vectara \
     XDG_RUNTIME_DIR=/tmp \
@@ -74,6 +82,15 @@ RUN playwright install --with-deps firefox \
 
 # Set working directory
 WORKDIR ${HOME}
+
+COPY docker/bin/download-easyocr-models.py /bin/
+
+ARG DOWNLOAD_EASYOCR_MODELS=false
+
+RUN if [ "$DOWNLOAD_EASYOCR_MODELS" = "true" ]; then \
+            python3 /bin/download-easyocr-models.py 1>&2; \
+    fi
+
 
 # Copy application code
 COPY *.py $HOME/

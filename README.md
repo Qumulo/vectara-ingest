@@ -29,6 +29,15 @@ Vectara is the trusted GenAI platform providing simple [APIs](https://docs.vecta
 For more information about this repository, see [Code Organization](#code-organization) and [Crawling](#crawling).
 
 # Getting Started Guide
+
+vectara-ingest can be used in multiple ways:
+
+1. **Docker container** - The instructions below show how to run vectara-ingest in a Docker container
+2. **Command-line interface (CLI)** - vectara-ingest can be installed as a CLI tool using conda
+3. **Python package** - vectara-ingest can be imported and used in your Python applications
+
+For details on using vectara-ingest as a conda package or importing it in your code, please refer to the [conda/README.md](conda/README.md) file.
+
 This guide explains how to create a basic crawler to scrape content from [Paul Graham's website](http://www.paulgraham.com/index.html), and ingest it into Vectara.
 
 ## Prerequisites
@@ -127,7 +136,7 @@ For our example we would index the content of https://www.paulgraham.com website
 
    **Note:** To protect your system's resources and make it easier to move your crawlers to the cloud, the crawler executes inside a Docker container. This is a lengthy process because in involves numerous dependencies
 
-1. When the container is set up, you can track your crawler’s progress:
+1. When the container is set up, you can track your crawler's progress:
 
    ```bash
    docker logs -f vingest
@@ -205,6 +214,9 @@ vectara:
   # where XXX is a unique ID.
   store_docs: false
   
+  # Directory path where vectara-ingest will store all output files, including reports, temporary files, credentials, and other artifacts. When running locally, this path is relative to the current working directory. When running in Docker, files are inside the container at `/home/vectara/env/`. Default value is `vectara_ingest_output`.
+  output_dir: vectara_ingest_output
+
   # timeout: sets the URL crawling timeout in seconds (optional; defaults to 90)
   # this applies to crawling web pages.
   timeout: 90
@@ -314,6 +326,17 @@ doc_processing:
 crawling:
   # type of crawler; valid options are website, docusaurus, notion, jira, rss, mediawiki, discourse, github and others (this continues to evolve as new crawler types are added)
   crawler_type: XXX
+
+
+# This section can be added to your job configuration to allow tagging of metadata statically.
+# Each document created in the corpus will have the document metadata merged with the metadata here.
+# If a crawler adds metadata that conflicts with this metadata, the crawler metadata will be used.
+metadata:
+   project: foo
+   groups:
+     - group1
+     - group2
+     - group3
 ```
 
 Following that, where needed, the same YAML configuration file will a include crawler-specific section with crawler-specific parameters (see [about crawlers](crawlers/CRAWLERS.md)):
@@ -389,6 +412,10 @@ The `reindex` parameter determines whether an existing document should be reinde
 ### Docker
 
 The project is designed to be used within a Docker container, so that a crawl job can be run anywhere - on a local machine or on any cloud machine. See the [Dockerfile](https://github.com/vectara/vectara-ingest/blob/main/Dockerfile) for more information on the Docker file structure and build.
+
+#### HTTP Proxy
+
+If the `http_proxy`, `https_proxy`, or `no_proxy` environment variables exist, they will be used during the docker build step.
 
 ### Local deployment
 

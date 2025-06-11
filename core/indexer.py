@@ -32,7 +32,7 @@ from core.models import get_api_key
 from core.utils import (
     html_to_text, detect_language, get_file_size_in_MB, create_session_with_retries,
     mask_pii, safe_remove_file, url_to_filename, df_cols_to_headers, html_table_to_header_and_rows,
-    get_file_path_from_url, create_row_items, configure_session_for_ssl
+    get_file_path_from_url, create_row_items, configure_session_for_ssl, get_docker_or_local_path
 )
 from core.extract import get_article_content
 from core.doc_parser import UnstructuredDocumentParser, DoclingDocumentParser, LlamaParseDocumentParser, \
@@ -153,6 +153,7 @@ class Indexer:
         self.create_corpus = cfg.vectara.get("create_corpus", False)
         self.verbose = cfg.vectara.get("verbose", False)
         self.store_docs = cfg.vectara.get("store_docs", False)
+        self.output_dir = cfg.vectara.get("output_dir", "vectara_ingest_output")
         self.remove_code = cfg.vectara.get("remove_code", True)
         self.remove_boilerplate = cfg.vectara.get("remove_boilerplate", False)
         self.post_load_timeout = cfg.vectara.get("post_load_timeout", 5)
@@ -162,6 +163,7 @@ class Indexer:
         self.logger = logging.getLogger()
         self.whisper_model = None
         self.whisper_model_name = cfg.vectara.get("whisper_model", "base")
+        self.static_metadata = cfg.get('metadata', None)
 
         if 'doc_processing' not in cfg:
             cfg.doc_processing = {}
@@ -248,10 +250,14 @@ class Indexer:
             self.browser = self.p.firefox.launch(headless=True)
             self.browser_use_count = 0
         if self.store_docs:
-            self.store_docs_folder = '/home/vectara/env/indexed_docs_' + str(uuid.uuid4())
-            if os.path.exists(self.store_docs_folder):
-                shutil.rmtree(self.store_docs_folder)
-            os.makedirs(self.store_docs_folder)
+            uuid_suffix = f"indexed_docs_{str(uuid.uuid4())}"
+            docker_env_path = '/home/vectara/env'
+            
+            self.store_docs_folder = get_docker_or_local_path(
+                docker_path=os.path.join(docker_env_path, uuid_suffix),
+                output_dir=os.path.join(self.output_dir, uuid_suffix),
+                should_delete_existing=True
+            )
 
     def store_file(self, filename: str, orig_filename) -> None:
         if self.store_docs:
@@ -628,6 +634,9 @@ class Indexer:
             self.logger.error(f"File {filename} does not exist")
             return False
 
+        if self.static_metadata:
+            metadata.update({k: v for k, v in self.static_metadata.items() if k not in metadata})
+
         post_headers = {
             'Accept': 'application/json',
             'x-api-key': self.api_key,
@@ -707,6 +716,17 @@ class Indexer:
             else:
                 self.logger.info(f"Document {document['id']} already exists, skipping")
                 return False
+
+
+        if self.static_metadata:
+            metadata = None
+            if 'metadata' in document:
+                metadata = document['metadata']
+            else:
+                metadata = {}
+                document['metadata'] = metadata
+            metadata.update({k: v for k, v in self.static_metadata.items() if k not in metadata})
+
 
         if use_core_indexing:
             document['type'] = 'core'
@@ -964,7 +984,10 @@ class Indexer:
             metadatas = [{k: self.normalize_value(v) for k, v in md.items()} for md in metadatas]
 
         document = {}
-        document["id"] = doc_id
+        document["id"] = (
+            doc_id if len(doc_id) < 128 
+            else doc_id[:128] + "-" + hashlib.sha256(doc_id.encode('utf-8')).hexdigest()[:16]
+        )
 
         # Create tables structure
         tables_array = []
