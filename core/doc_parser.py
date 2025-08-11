@@ -1,4 +1,5 @@
 import logging
+logger = logging.getLogger(__name__)
 from typing import List, Tuple, Iterator
 import time
 import pandas as pd
@@ -35,8 +36,14 @@ nltk.download('averaged_perceptron_tagger_eng', quiet=True)
 from PIL import ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-logger = logging.getLogger(__name__)
 MAX_VERBOSE_LENGTH = 1000
+
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message=".*pin_memory.*no accelerator is found.*"
+)
+
 
 class DocumentParser():
     def __init__(
@@ -310,6 +317,7 @@ class DoclingDocumentParser(DocumentParser):
         verbose: bool = False,
         model_config: dict = {},
         chunking_strategy: str = 'hierarchical',
+        chunk_size: int = 1024,
         parse_tables: bool = False,
         enable_gmft: bool = False,
         do_ocr: bool = False,
@@ -326,19 +334,23 @@ class DoclingDocumentParser(DocumentParser):
             summarize_images=summarize_images
         )
         self.chunking_strategy = chunking_strategy
+        self.chunk_size = chunk_size
         self.image_scale = image_scale
         if self.verbose:
-            logger.info(f"Using DoclingParser with chunking strategy {self.chunking_strategy}")
+            logger.info(f"Using DoclingParser with chunking strategy {self.chunking_strategy} and chunk size {self.chunk_size}")
 
     @staticmethod
     def _lazy_load_docling():
-        from docling.document_converter import DocumentConverter, PdfFormatOption
-        from docling.datamodel.pipeline_options import PdfPipelineOptions, EasyOcrOptions
+        from docling.document_converter import DocumentConverter, PdfFormatOption, HTMLFormatOption
+        from docling.datamodel.pipeline_options import PdfPipelineOptions, EasyOcrOptions, PaginatedPipelineOptions
         from docling.datamodel.base_models import InputFormat
         from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
         from docling_core.transforms.chunker import HierarchicalChunker
 
-        return DocumentConverter, HybridChunker, HierarchicalChunker, PdfPipelineOptions, PdfFormatOption, InputFormat, EasyOcrOptions
+        return (
+            DocumentConverter, HybridChunker, HierarchicalChunker, PdfPipelineOptions,
+            PdfFormatOption, HTMLFormatOption, InputFormat, EasyOcrOptions, PaginatedPipelineOptions
+        )
 
     def _get_tables(self, tables):
         def _get_metadata(table):
@@ -378,16 +390,24 @@ class DoclingDocumentParser(DocumentParser):
         # Process using Docling
         (
             DocumentConverter, HybridChunker, HierarchicalChunker, PdfPipelineOptions,
-            PdfFormatOption, InputFormat, EasyOcrOptions
+            PdfFormatOption, HTMLFormatOption, InputFormat, EasyOcrOptions,
+            PaginatedPipelineOptions
         ) = self._lazy_load_docling()
 
         st = time.time()
-        pipeline_options = PdfPipelineOptions()
-        pipeline_options.images_scale = self.image_scale
-        pipeline_options.generate_picture_images = True
-        pipeline_options.do_ocr = False
+
+        html_opts = PaginatedPipelineOptions()
+        html_opts.generate_page_images = True
+        html_opts.images_scale = self.image_scale
+
+        pdf_opts = PdfPipelineOptions()
+        pdf_opts.images_scale = self.image_scale
+        pdf_opts.generate_picture_images = True
+        pdf_opts.do_ocr = False
+        pdf_opts.do_formula_enrichment = True
+
         if self.do_ocr:
-            pipeline_options.do_ocr = True
+            pdf_opts.do_ocr = True
             easy_ocr_config = self.cfg.doc_processing.easy_ocr_config
             ocr_options = EasyOcrOptions()
             mapping = {
@@ -407,17 +427,22 @@ class DoclingDocumentParser(DocumentParser):
                 value = getattr(easy_ocr_config, key, None)
                 if value is not None:
                     func(value)
-            pipeline_options.ocr_options = ocr_options
+            pdf_opts.ocr_options = ocr_options
         res = DocumentConverter(
+            allowed_formats=[InputFormat.PDF, InputFormat.HTML],
             format_options={
-                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts),
+                InputFormat.HTML: HTMLFormatOption(pipeline_options=html_opts),
             }
         ).convert(filename)
         doc = res.document
         doc_title = doc.name
 
         if self.chunking_strategy == 'hybrid' or self.chunking_strategy == 'hierarchical':
-            chunker = HybridChunker() if self.chunking_strategy == 'hybrid' else HierarchicalChunker()
+            chunker = (
+                HybridChunker(max_tokens=self.chunk_size) 
+                if self.chunking_strategy == 'hybrid' else HierarchicalChunker()
+            )
             def _get_metadata(chunk):
                 md = {'parser_element_type': 'text'}
                 if chunk.meta.doc_items and chunk.meta.doc_items[0].prov:
@@ -508,10 +533,11 @@ class UnstructuredDocumentParser(DocumentParser):
         mime_type = detect_file_type(filename)
         partition_kwargs = {}
         if mode == 'text':
-            partition_kwargs = {} if self.chunking_strategy == 'none' else {
-                "chunking_strategy": self.chunking_strategy,
-                "max_characters": self.chunk_size
-            }
+            if self.chunking_strategy != 'none':
+                partition_kwargs = {
+                    "chunking_strategy": self.chunking_strategy,
+                    "max_characters": self.chunk_size,
+                }
         else:
             partition_kwargs = {'infer_table_structure': True }
             if mime_type == 'application/pdf':

@@ -1,0 +1,56 @@
+csv_parser:
+  mode: element
+  file_path: "tests/data/dataframe/fdic-failed-banks.csv"
+  doc_id_columns: ['City', 'State']
+  text_columns: [BankName, AcquiringInstitution]
+  metadata_columns: ["ClosingDate", "Fund"]
+  column_types:
+    Fund: str
+
+doc_processing:
+  model_config:
+    text: {}
+
+vectara: {}
+
+test:
+  doc_id: test_doc
+  input_path:
+    - tests
+    - data
+    - dataframe
+    - fdic-failed-banks.csv
+  expected_index_segments_calls:
+    - doc_id: test_doc-Acworth - GA
+      doc_metadata:
+        ClosingDate: 30-Jul-10
+        Fund: '10274'
+      doc_title: "fdic-failed-banks.csv"
+      metadatas:
+        - ClosingDate: 30-Jul-10
+          Fund: '10274'
+      texts:
+        - Northwest Bank & Trust - State Bank and Trust Company
+      titles: null
+    - doc_id: test_doc-Ailey - GA
+      doc_metadata:
+        ClosingDate: 6-Jul-12
+        Fund: '10448'
+      doc_title: "fdic-failed-banks.csv"
+      metadatas:
+        - ClosingDate: 6-Jul-12
+          Fund: '10448'
+      texts:
+        - Montgomery Bank & Trust - Ameris Bank
+      titles: null
+    - doc_id: test_doc-Alamo - TN
+      doc_metadata:
+        ClosingDate: 8-Nov-02
+        Fund: '4658'
+      doc_title: "fdic-failed-banks.csv"
+      metadatas:
+        - ClosingDate: 8-Nov-02
+          Fund: '4658'
+      texts:
+        - Bank of Alamo - No Acquirer
+      titles: null

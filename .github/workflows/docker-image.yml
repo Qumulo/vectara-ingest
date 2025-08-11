@@ -1,0 +1,180 @@
+name: Create and publish Docker images
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., 2.0.8)'
+        required: true
+        default: 'latest'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  DOCKERHUB_IMAGE_NAME: vectara/vectara-ingest
+
+jobs:
+  build-and-push-image:
+    runs-on: ubuntu-medium
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initial disk cleanup
+        uses: ./.github/actions/disk-cleanup
+        with:
+          methods: 'packages,temp,docker'
+          show-usage: 'true'
+        
+      - name: Setup cache for Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.ref_name }}-${{ github.run_number }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-${{ github.ref_name }}-
+            ${{ runner.os }}-buildx-main-
+            ${{ runner.os }}-buildx-
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Login to Docker Hub
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Login to GitHub Container Registry
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION=${{ github.event.inputs.version }}
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      # Build and push regular version
+      - name: Build and push regular Docker image
+        id: push_regular
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            INSTALL_EXTRA=false
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.DOCKERHUB_IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ${{ env.DOCKERHUB_IMAGE_NAME }}:latest
+          cache-from: |
+            type=gha
+            type=local,src=/tmp/.buildx-cache
+          cache-to: |
+            type=gha,mode=max
+            type=local,dest=/tmp/.buildx-cache-new,mode=max
+
+      - name: Monitor disk space after regular build
+        run: |
+          # Monitor disk space without aggressive cleanup
+          echo "Disk space after regular build:"
+          df -h
+
+      # Build and push full version
+      - name: Build and push full Docker image
+        id: push_full
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            INSTALL_EXTRA=true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}.full
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest.full
+            ${{ env.DOCKERHUB_IMAGE_NAME }}:${{ steps.version.outputs.version }}.full
+            ${{ env.DOCKERHUB_IMAGE_NAME }}:latest.full
+          cache-from: |
+            type=gha
+            type=local,src=/tmp/.buildx-cache
+          cache-to: |
+            type=gha,mode=max
+            type=local,dest=/tmp/.buildx-cache-new,mode=max
+
+      - name: Rotate build cache
+        run: |
+          # Rotate Docker build cache to prevent accumulation
+          if [ -d "/tmp/.buildx-cache-new" ]; then
+            rm -rf /tmp/.buildx-cache || true
+            mv /tmp/.buildx-cache-new /tmp/.buildx-cache || true
+          fi
+          
+      - name: Final cleanup and disk space report
+        run: |
+          # Comprehensive cleanup after all builds complete
+          if command -v docker >/dev/null 2>&1; then
+            echo "Performing comprehensive Docker cleanup..."
+            # Remove unused images and containers (but preserve volumes for safety)
+            if docker system prune --all --force; then
+              echo "Docker cleanup completed successfully"
+            else
+              echo "Warning: Docker cleanup failed, but continuing..."
+            fi
+            
+            # Only remove volumes if disk space is critically low
+            DISK_USAGE=$(df --output=pcent / | tail -1 | tr -d '%')
+            if [ -n "$DISK_USAGE" ] && [ "$DISK_USAGE" -gt 90 ]; then
+              echo "Disk usage is ${DISK_USAGE}%, removing Docker volumes..."
+              docker volume prune --force || echo "Warning: Volume cleanup failed"
+            elif [ -n "$DISK_USAGE" ]; then
+              echo "Disk usage is ${DISK_USAGE}%, skipping volume cleanup"
+            else
+              echo "Warning: Failed to determine disk usage, skipping volume cleanup"
+            fi
+          else
+            echo "Warning: Docker is not available for cleanup"
+          fi
+          
+          # Final disk space report
+          echo "Final disk space status:"
+          df -h
+
+      # Generate attestation for regular image
+      - name: Generate artifact attestation for regular image
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME}}
+          subject-digest: ${{ steps.push_regular.outputs.digest }}
+          push-to-registry: true
+
+      # Generate attestation for full image
+      - name: Generate artifact attestation for full image
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME}}
+          subject-digest: ${{ steps.push_full.outputs.digest }}
+          push-to-registry: true 

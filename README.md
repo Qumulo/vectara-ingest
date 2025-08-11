@@ -296,6 +296,14 @@ doc_processing:
   # use OCR when parsing documents (Docling only)
   do_ocr: true
 
+   # Optional parameters for EasyOCR if used (partial list)
+  easy_ocr_config:
+     download_enabled: true
+     use_gpu: false
+     lang: ['en', 'fr', 'de']
+     confidence_threshold: 0.5
+     force_full_page_ocr: false
+
   # Whether or not to summarize image content using GPT-4o vision 
   # When using this feature, you need to list the OPENAI_API_KEY or ANTHRPIC_API_KEY in your `secrets.toml` 
   # under a special profile called `general`.
@@ -311,6 +319,7 @@ doc_processing:
   docling_config:
     chunking_strategy: hybrid          # chunking strategy to use: hierarchical, hybrid or none (default hybrid)
     image_scale: 1.0                   # set to 2.0 for larger resolution in diagrams. 1.0 is equivalent to 72 DPI
+    chunk_size: 1024                   # chunk size if using docling chunking; default 1024; only valid for hybrid chunker
 
   # whether to use core_indexing which maintains the chunks from unstructured or docling, or let vectara chunk further
   use_core_indexing: false            
@@ -418,6 +427,15 @@ The project is designed to be used within a Docker container, so that a crawl jo
 #### HTTP Proxy
 
 If the `http_proxy`, `https_proxy`, or `no_proxy` environment variables exist, they will be used during the docker build step.
+
+#### Additional environment variables
+
+Additional environment variables can be injected into the docker container using the `.run-env` file. Below is an example
+of the format. 
+
+```bash
+HF_ENDPOINT="http://localhost:9000"
+```
 
 ### Local deployment
 

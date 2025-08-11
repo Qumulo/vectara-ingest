@@ -4,6 +4,10 @@
 #
 #    pip-compile requirements-extra.in
 #
+accelerate==1.7.0
+    # via
+    #   -c /Users/ofer/dev/vectara-ingest/requirements.txt
+    #   unstructured-inference
 aiofiles==24.1.0
     # via
     #   -c /Users/ofer/dev/vectara-ingest/requirements.txt
@@ -190,6 +194,7 @@ httpx==0.28.1
 huggingface-hub==0.32.4
     # via
     #   -c /Users/ofer/dev/vectara-ingest/requirements.txt
+    #   accelerate
     #   timm
     #   tokenizers
     #   transformers
@@ -288,6 +293,7 @@ nltk==3.9.1
 numpy==1.26.4
     # via
     #   -c /Users/ofer/dev/vectara-ingest/requirements.txt
+    #   accelerate
     #   blis
     #   contourpy
     #   h5py
@@ -333,6 +339,7 @@ openpyxl==3.1.5
 packaging==25.0
     # via
     #   -c /Users/ofer/dev/vectara-ingest/requirements.txt
+    #   accelerate
     #   huggingface-hub
     #   marshmallow
     #   matplotlib
@@ -404,6 +411,7 @@ protobuf==4.25.8
 psutil==6.1.0
     # via
     #   -c /Users/ofer/dev/vectara-ingest/requirements.txt
+    #   accelerate
     #   unstructured
 pyasn1==0.6.1
     # via
@@ -489,6 +497,7 @@ pytz==2025.2
 pyyaml==6.0.2
     # via
     #   -c /Users/ofer/dev/vectara-ingest/requirements.txt
+    #   accelerate
     #   huggingface-hub
     #   omegaconf
     #   presidio-analyzer
@@ -536,6 +545,7 @@ rsa==4.9.1
 safetensors==0.4.3
     # via
     #   -c /Users/ofer/dev/vectara-ingest/requirements.txt
+    #   accelerate
     #   timm
     #   transformers
 scipy==1.15.3
@@ -597,14 +607,15 @@ tokenizers==0.21.1
     # via
     #   -c /Users/ofer/dev/vectara-ingest/requirements.txt
     #   transformers
-torch==2.4.1
+torch==2.7.1
     # via
     #   -c /Users/ofer/dev/vectara-ingest/requirements.txt
+    #   accelerate
     #   effdet
     #   timm
     #   torchvision
     #   unstructured-inference
-torchvision==0.19.1
+torchvision==0.22.1
     # via
     #   -c /Users/ofer/dev/vectara-ingest/requirements.txt
     #   -r requirements-extra.in
@@ -618,7 +629,7 @@ tqdm==4.67.1
     #   spacy
     #   transformers
     #   unstructured
-transformers==4.51.3
+transformers==4.53.2
     # via
     #   -c /Users/ofer/dev/vectara-ingest/requirements.txt
     #   unstructured-inference
@@ -655,7 +666,7 @@ tzdata==2025.2
     # via
     #   -c /Users/ofer/dev/vectara-ingest/requirements.txt
     #   pandas
-unstructured[all-docs]==0.17.2
+unstructured[all-docs]==0.18.7
     # via
     #   -c /Users/ofer/dev/vectara-ingest/requirements.txt
     #   -r requirements-extra.in
@@ -663,7 +674,7 @@ unstructured-client==0.36.0
     # via
     #   -c /Users/ofer/dev/vectara-ingest/requirements.txt
     #   unstructured
-unstructured-inference==0.8.10
+unstructured-inference==1.0.5
     # via
     #   -c /Users/ofer/dev/vectara-ingest/requirements.txt
     #   unstructured

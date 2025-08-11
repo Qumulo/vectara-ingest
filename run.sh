@@ -140,6 +140,10 @@ if [[ -n "${LOGGING_LEVEL}" ]]; then
   ADDITIONAL_DOCKER_FLAGS="${ADDITIONAL_DOCKER_FLAGS} -e LOGGING_LEVEL=${LOGGING_LEVEL}"
 fi
 
+if [[ -f .run-env ]]; then
+  ADDITIONAL_DOCKER_FLAGS="${ADDITIONAL_DOCKER_FLAGS} --env-file .run-env"
+fi
+
 # Run docker container
 config_file_name="${1##*/}"
 if [[ "${crawler_type}" == "folder" ]]; then
@@ -158,7 +162,8 @@ elif [[ "$crawler_type" == "csv" ]]; then
         echo "Error: CSV file '$file_path' does not exist."
         exit 5
     fi
-    ADDITIONAL_DOCKER_FLAGS="${ADDITIONAL_DOCKER_FLAGS} -v $file_path:/home/vectara/data/file"
+    file_name=$(basename "$file_path")
+    ADDITIONAL_DOCKER_FLAGS="${ADDITIONAL_DOCKER_FLAGS} -v $file_path:/home/vectara/data/$file_name"
 
 elif [[ "$crawler_type" == "bulkupload" ]]; then
     # special handling of "bulkupload crawler" where we need to mount the JSON file under /home/vectara/data
