@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 from core.crawler import Crawler
 from core.indexer import Indexer
-from core.utils import RateLimiter, setup_logging
+from core.utils import RateLimiter, setup_logging, AUDIO_EXTENSIONS, VIDEO_EXTENSIONS
 
 from slugify import slugify
 import pandas as pd
@@ -32,6 +32,29 @@ def create_s3_client(cfg):
     else:
         raise ValueError("No AWS credentials found!")
     
+    # Handle SSL verification based on vectara config
+    ssl_verify = cfg.vectara.get("ssl_verify", None)
+    if ssl_verify is False or (isinstance(ssl_verify, str) and ssl_verify.lower() in ("false", "0")):
+        logger.warning("Disabling SSL verification for S3 client.")
+        client_kwargs['verify'] = False
+    elif ssl_verify is True or (isinstance(ssl_verify, str) and ssl_verify.lower() in ("true", "1")):
+        # Use default SSL verification - no need to set verify parameter
+        logger.debug("Using default SSL verification for S3 client.")
+    elif isinstance(ssl_verify, str):
+        # If ssl_verify is a string and not true/false, treat it as a path to certificate file
+        if os.path.exists(ssl_verify):
+            logger.info(f"Using certificate path for S3 client: {ssl_verify}")
+            client_kwargs['verify'] = ssl_verify
+        else:
+            # Try expanded path (handles ~ in paths)
+            ca_path = os.path.expanduser(ssl_verify)
+            if os.path.exists(ca_path):
+                logger.info(f"Using expanded certificate path for S3 client: {ca_path}")
+                client_kwargs['verify'] = ca_path
+            else:
+                logger.warning(f"Certificate path '{ssl_verify}' not found. Using default SSL verification for S3 client.")
+    # If ssl_verify is None or any other value, use default SSL verification (don't set verify parameter)
+    
     return boto3.client('s3', **client_kwargs)
 
 class FileCrawlWorker(object):
@@ -50,20 +73,17 @@ class FileCrawlWorker(object):
         s3 = create_s3_client(self.cfg)
         extension = pathlib.Path(s3_file).suffix
         local_fname = slugify(s3_file.replace(extension, ''), separator='_') + '.' + extension
-        metadata = {"source": source, "url": s3_file}
         logger.info(f"Crawling and indexing {s3_file}")
         try:
             with self.rate_limiter:
                 s3.download_file(self.bucket, s3_file, local_fname)
                 url = f's3://{self.bucket}/{s3_file}'
-                metadata = {
-                    'source': 's3',
+                metadata.update({
+                    'source': source,
                     'title': s3_file,
                     'url': url
-                }
-                if s3_file in metadata:
-                    metadata.update(metadata.get(s3_file, {}))
-                if extension in ['.mp3', '.mp4']:
+                })
+                if extension in AUDIO_EXTENSIONS + VIDEO_EXTENSIONS:
                     succeeded = self.indexer.index_media_file(local_fname, metadata)
                 else:
                     succeeded = self.indexer.index_file(filename=local_fname, uri=url, metadata=metadata)
@@ -161,6 +181,7 @@ class S3Crawler(Crawler):
                 a.setup.remote()
             pool = ray.util.ActorPool(actors)
             _ = list(pool.map(lambda a, u: a.process.remote(u, metadata=metadata, source=source), files_to_process))
+            ray.shutdown()
         else:
             crawl_worker = FileCrawlWorker(self.indexer, self, num_per_second, bucket, self.cfg)
             for inx, url in enumerate(files_to_process):
