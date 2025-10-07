@@ -1,4 +1,4 @@
-# v.4.2-1237321225
+# v.4.3-32417225
 
 vectara:
   corpus_key: Qumulo_Main_5
@@ -11,8 +11,8 @@ crawling:
 
 website_crawler:
   urls: [https://qumulo.com]
-  pos_regex: [".*qumulo.com/blog.*"]
-  neg_regex: [".*care.qumulo.*"]
+  pos_regex: ["^https:\/\/qumulo.com\/?(.*)?$"]
+ #neg_regex: [".*care.qumulo.*",".*docs.qumulo.com.*"]
   pages_source: crawl
   extraction: playwright
   delay: 1
