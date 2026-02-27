@@ -4,7 +4,8 @@ from typing import List, Tuple, Iterator, Dict, Any
 import time
 import pandas as pd
 import os
-from io import StringIO
+from io import StringIO, BytesIO
+import gc
 import base64
 import requests
 from dataclasses import dataclass
@@ -184,15 +185,20 @@ class DocumentParser():
         self.image_summarizer = ImageSummarizer(self.cfg, vision_config) if self.summarize_images and vision_config else None
         self.verbose = verbose
 
+    def cleanup(self):
+        """Release heavy resources. Subclasses may override for parser-specific cleanup."""
+        self.table_summarizer = None
+        self.image_summarizer = None
+
     def parse(self, filename: str, source_url: str = "No URL") -> ParsedDocument:
         """
         Parse a document and return unified content stream with proper element ordering.
         Subclasses must override this method.
-        
+
         Args:
             filename: Path to the file to parse
             source_url: Source URL for context
-            
+
         Returns:
             ParsedDocument with unified content stream
         """
@@ -376,18 +382,20 @@ class DocupandaDocumentParser(DocumentParser):
                 bbox_pixels = (int(bbox[0] * image_dims[0]), int(bbox[1] * image_dims[1]),
                                int(bbox[2] * image_dims[0]), int(bbox[3] * image_dims[1]))
                 img_cropped = img.crop(box=bbox_pixels)
-                image_path = 'image.png'
-                with open(image_path, 'wb') as fp:
-                    img_cropped.save(fp, 'PNG')
-                
-                # Store image binary data
-                with open(image_path, 'rb') as fp:
-                    image_binary = fp.read()
+
+                # Convert PIL image to PNG bytes in memory (no disk write)
+                buf = BytesIO()
+                img_cropped.save(buf, format='PNG')
+                image_binary = buf.getvalue()
+                buf.close()
+                del img_cropped
+
                 image_id = f"docupanda_page_{page_num}_image_{img_num}"
                 image_bytes.append((image_id, image_binary))
-                
+
                 image_summary = self.image_summarizer.summarize_image(
-                    image_path, source_url, previous_text, next_text
+                    '', source_url, previous_text, next_text,
+                    image_bytes=image_binary
                 )
                 if image_summary and len(image_summary) > 10:
                     metadata = {
@@ -609,7 +617,10 @@ class DoclingDocumentParser(DocumentParser):
         do_ocr: bool = False,
         summarize_images: bool = False,
         image_scale: float = 1.0,
-        image_context: dict = None
+        image_context: dict = None,
+        layout_model: str = None,
+        do_formula_enrichment: bool = False,
+        fallback_ocr: bool = False
     ):
         super().__init__(
             cfg=cfg,
@@ -624,8 +635,14 @@ class DoclingDocumentParser(DocumentParser):
         self.chunk_size = chunk_size
         self.image_scale = image_scale
         self.image_context = image_context or {'num_previous_chunks': 1, 'num_next_chunks': 1}
+        self.layout_model = layout_model  # Options: None (default heron), 'heron', 'heron_101', 'v2'
+        self.do_formula_enrichment = do_formula_enrichment
+        self.fallback_ocr = fallback_ocr
+        self._converter = None
+        self._ocr_converter = None
         if self.verbose:
-            logger.info(f"Using DoclingParser with chunking strategy {self.chunking_strategy} and chunk size {self.chunk_size}")
+            layout_info = f", layout_model '{self.layout_model}'" if self.layout_model else ""
+            logger.info(f"Using DoclingParser with chunking strategy {self.chunking_strategy} and chunk size {self.chunk_size}{layout_info}")
 
     @staticmethod
     def _lazy_load_docling():
@@ -638,17 +655,26 @@ class DoclingDocumentParser(DocumentParser):
         )
 
         from docling.document_converter import DocumentConverter, PdfFormatOption, HTMLFormatOption, PowerpointFormatOption, WordFormatOption
-        from docling.datamodel.pipeline_options import PdfPipelineOptions, EasyOcrOptions, PaginatedPipelineOptions
+        from docling.datamodel.pipeline_options import PdfPipelineOptions, EasyOcrOptions, RapidOcrOptions, PaginatedPipelineOptions
         from docling.datamodel.base_models import InputFormat
         from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
         from docling_core.transforms.chunker import HierarchicalChunker
+        from docling.datamodel.pipeline_options import LayoutOptions
+        from docling.datamodel.layout_model_specs import DOCLING_LAYOUT_HERON, DOCLING_LAYOUT_HERON_101, DOCLING_LAYOUT_V2
+
+        layout_model_specs = {}
+        layout_model_specs['LayoutOptions'] = LayoutOptions
+        layout_model_specs['heron'] = DOCLING_LAYOUT_HERON
+        layout_model_specs['heron_101'] = DOCLING_LAYOUT_HERON_101
+        layout_model_specs['v2'] = DOCLING_LAYOUT_V2
 
         return (
             DocumentConverter, HybridChunker, HierarchicalChunker, PdfPipelineOptions,
-            PdfFormatOption, HTMLFormatOption, PowerpointFormatOption, WordFormatOption, InputFormat, EasyOcrOptions, PaginatedPipelineOptions
+            PdfFormatOption, HTMLFormatOption, PowerpointFormatOption, WordFormatOption, InputFormat,
+            EasyOcrOptions, RapidOcrOptions, PaginatedPipelineOptions, layout_model_specs
         )
 
-    def _get_tables(self, tables):
+    def _get_tables(self, tables, doc=None):
         def _get_metadata(table):
             md = {}
             if table.prov:
@@ -656,7 +682,7 @@ class DoclingDocumentParser(DocumentParser):
             return md
         for table in tables:
             try:
-                table_df = table.export_to_dataframe()
+                table_df = table.export_to_dataframe(doc) if doc else table.export_to_dataframe()
                 table_md = table_df.to_markdown()
                 table_summary = self.table_summarizer.summarize_table_text(table_md)
                 yield (table_df, table_summary, '', _get_metadata(table))
@@ -664,20 +690,31 @@ class DoclingDocumentParser(DocumentParser):
                 logger.error(f"Error parsing Markdown table: {err}. Skipping...")
                 continue
 
-    def parse(self, filename: str, source_url: str = "No URL") -> ParsedDocument:
-        """
-        Parse a local file and return unified content stream with images interleaved in proper order.
-        Tables are extracted separately for structured indexing.
-        Uses position-based ordering to maintain document structure.
-        """
-        # Process using Docling
-        (
-            DocumentConverter, HybridChunker, HierarchicalChunker, PdfPipelineOptions,
-            PdfFormatOption, HTMLFormatOption, PowerpointFormatOption, WordFormatOption, InputFormat, EasyOcrOptions,
-            PaginatedPipelineOptions
-        ) = self._lazy_load_docling()
+    def cleanup(self):
+        """Release the cached Docling converter and its ML models."""
+        super().cleanup()
+        self._converter = None
+        self._ocr_converter = None
 
-        st = time.time()
+    def _get_or_create_converter(self, fallback_ocr: bool = False):
+        """Build the DocumentConverter once and cache it for reuse across files.
+
+        Args:
+            fallback_ocr: When True, returns a separate OCR-enabled converter
+                       cached in self._ocr_converter.
+        """
+        if fallback_ocr:
+            if self._ocr_converter is not None:
+                return self._ocr_converter
+        else:
+            if self._converter is not None:
+                return self._converter
+
+        (
+            DocumentConverter, _, _, PdfPipelineOptions,
+            PdfFormatOption, HTMLFormatOption, PowerpointFormatOption, WordFormatOption, InputFormat,
+            EasyOcrOptions, RapidOcrOptions, PaginatedPipelineOptions, layout_model_specs
+        ) = self._lazy_load_docling()
 
         html_opts = PaginatedPipelineOptions()
         html_opts.generate_page_images = True
@@ -687,18 +724,54 @@ class DoclingDocumentParser(DocumentParser):
         pdf_opts.images_scale = self.image_scale
         pdf_opts.generate_picture_images = True
         pdf_opts.do_ocr = False
-        pdf_opts.do_formula_enrichment = True
-        
+        pdf_opts.do_formula_enrichment = self.do_formula_enrichment
+
+        # Configure layout model if specified
+        valid_layout_models = [k for k in layout_model_specs.keys() if k != 'LayoutOptions']
+        if self.layout_model and self.layout_model in valid_layout_models:
+            LayoutOptions = layout_model_specs.get('LayoutOptions')
+            model_spec = layout_model_specs.get(self.layout_model)
+            if LayoutOptions and model_spec:
+                pdf_opts.layout_options = LayoutOptions(model_spec=model_spec)
+                logger.info(f"Using custom layout model: {self.layout_model}")
+        elif self.layout_model:
+            logger.warning(f"Layout model '{self.layout_model}' not found. Available: {[k for k in layout_model_specs.keys() if k != 'LayoutOptions']}")
+
         # Pipeline options for Office documents
         office_opts = PaginatedPipelineOptions()
         office_opts.generate_page_images = True
         office_opts.images_scale = self.image_scale
 
-        if self.do_ocr:
-            pdf_opts.do_ocr = True
-            easy_ocr_config = self.cfg.doc_processing.easy_ocr_config
+        # Get OCR engine preference from config (default to 'easyocr')
+        ocr_engine = getattr(self.cfg.doc_processing, "ocr_engine", "easyocr")
+
+        # Configure OCR options based on engine choice
+        if ocr_engine == "rapidocr":
+            ocr_config = getattr(self.cfg.doc_processing, "rapid_ocr_config", None)
+            ocr_config = OmegaConf.to_container(
+                ocr_config, resolve=True
+            ) if ocr_config is not None else {}
+            ocr_options = RapidOcrOptions()
+            rapid_mapping = {
+                "bitmap_area_threshold": lambda val: setattr(ocr_options, "bitmap_area_threshold", val),
+                "force_full_page_ocr": lambda val: setattr(ocr_options, "force_full_page_ocr", val),
+                "lang": lambda val: setattr(ocr_options, "lang", val),
+                "use_det": lambda val: setattr(ocr_options, "use_det", val),
+                "use_cls": lambda val: setattr(ocr_options, "use_cls", val),
+                "text_score": lambda val: setattr(ocr_options, "text_score", val),
+            }
+            for key, func in rapid_mapping.items():
+                value = ocr_config.get(key)
+                if value is not None:
+                    func(value)
+            logger.info("Using RapidOCR engine for PDF processing")
+        else:  # Default to EasyOCR
+            ocr_config = getattr(self.cfg.doc_processing, "easy_ocr_config", None)
+            ocr_config = OmegaConf.to_container(
+                ocr_config, resolve=True
+            ) if ocr_config is not None else {}
             ocr_options = EasyOcrOptions()
-            mapping = {
+            easy_mapping = {
                 "bitmap_area_threshold": lambda val: setattr(ocr_options, "bitmap_area_threshold", val),
                 "confidence_threshold": lambda val: setattr(ocr_options, "confidence_threshold", val),
                 "download_enabled": lambda val: setattr(ocr_options, "download_enabled", val),
@@ -710,14 +783,19 @@ class DoclingDocumentParser(DocumentParser):
                 "recog_network": lambda val: setattr(ocr_options, "recog_network", val),
                 "use_gpu": lambda val: setattr(ocr_options, "use_gpu", val),
             }
-
-            for key, func in mapping.items():
-                value = getattr(easy_ocr_config, key, None)
+            for key, func in easy_mapping.items():
+                value = ocr_config.get(key)
                 if value is not None:
                     func(value)
-            pdf_opts.ocr_options = ocr_options
-            
-        res = DocumentConverter(
+            logger.info("Using EasyOCR engine for PDF processing")
+
+        # Always set OCR options to prevent pipeline initialization failure
+        pdf_opts.ocr_options = ocr_options
+
+        if self.do_ocr or fallback_ocr:
+            pdf_opts.do_ocr = True
+
+        converter = DocumentConverter(
             allowed_formats=[
                 InputFormat.PDF, InputFormat.HTML, InputFormat.PPTX, InputFormat.DOCX,
             ],
@@ -727,10 +805,32 @@ class DoclingDocumentParser(DocumentParser):
                 InputFormat.PPTX: PowerpointFormatOption(pipeline_options=office_opts),
                 InputFormat.DOCX: WordFormatOption(pipeline_options=office_opts),
             }
-        ).convert(filename)
+        )
+
+        if fallback_ocr:
+            self._ocr_converter = converter
+        else:
+            self._converter = converter
+        return converter
+
+    def _parse_with_converter(self, filename: str, source_url: str, converter) -> ParsedDocument:
+        """
+        Core parsing logic shared by the normal and OCR-fallback paths.
+
+        Converts *filename* with *converter*, extracts text / images / tables,
+        applies chunking, and returns a ``ParsedDocument``.
+        """
+        # Lazy-load docling modules (Python caches imports, so subsequent calls are cheap)
+        (
+            _, HybridChunker, HierarchicalChunker, _,
+            _, _, _, _, _,
+            _, _, _, _
+        ) = self._lazy_load_docling()
+
+        res = converter.convert(filename)
         doc = res.document
         doc_title = extract_document_title(filename)
-        
+
         # Fallback to Docling document name if no document metadata title found
         if not doc_title and doc.name:
             doc_title = doc.name
@@ -740,7 +840,7 @@ class DoclingDocumentParser(DocumentParser):
         positioned_elements = []  # List of (position, content, metadata) tuples
         all_items = []  # Collect all items for context extraction
         image_bytes = []  # Store image binary data
-        
+
         # First pass: collect all items for context extraction
         element_index = 0
         for item, _ in doc.iterate_items():
@@ -748,10 +848,10 @@ class DoclingDocumentParser(DocumentParser):
             page_no = 0
             if hasattr(item, 'prov') and item.prov:
                 page_no = item.prov[0].page_no
-            
+
             base_position = page_no * 1000
             position = base_position + element_index
-            
+
             # Store item with its position and page info
             all_items.append({
                 'item': item,
@@ -760,19 +860,22 @@ class DoclingDocumentParser(DocumentParser):
                 'index': element_index
             })
             element_index += 1
-        
+
+        # Pre-build items list once for context extraction (avoids rebuilding per image)
+        items_list = [i['item'] for i in all_items]
+
         # Second pass: process items with context
         for idx, item_info in enumerate(all_items):
             item = item_info['item']
             page_no = item_info['page_no']
             position = item_info['position']
-            
+
             # Check what type of item this is
             if hasattr(item, 'export_to_dataframe'):
                 # Table element - skip inline, will be processed separately for structured indexing
                 if self.verbose and self.parse_tables:
                     logger.info(f"Table found on page {page_no} - will be processed for structured indexing")
-                
+
             elif hasattr(item, 'text'):
                 # Text element
                 metadata = {
@@ -780,31 +883,32 @@ class DoclingDocumentParser(DocumentParser):
                     'page': page_no
                 }
                 positioned_elements.append((position, item.text, metadata))
-                
+
             elif hasattr(item, 'get_image') and self.summarize_images:
                 # Picture element - extract context from surrounding items
                 previous_text, next_text = extract_image_context(
-                    [i['item'] for i in all_items],
+                    items_list,
                     idx,
                     num_previous=self.image_context['num_previous_chunks'],
                     num_next=self.image_context['num_next_chunks'],
                     text_extractor=lambda x: x.text if hasattr(x, 'text') else None
                 )
-                
+
                 image = item.get_image(doc)
                 if image:
-                    image_path = 'image.png'
-                    with open(image_path, 'wb') as fp:
-                        image.save(fp, 'PNG')
-                    
-                    # Store image binary data
-                    with open(image_path, 'rb') as fp:
-                        image_binary = fp.read()
+                    # Convert PIL image to PNG bytes in memory (no disk write)
+                    buf = BytesIO()
+                    image.save(buf, format='PNG')
+                    image_binary = buf.getvalue()
+                    buf.close()
+                    del image
+
                     image_id = f"docling_page_{page_no}_image_{len(image_bytes)}"
                     image_bytes.append((image_id, image_binary))
-                    
+
                     image_summary = self.image_summarizer.summarize_image(
-                        image_path, source_url, previous_text, next_text
+                        '', source_url, previous_text, next_text,
+                        image_bytes=image_binary
                     )
                     if image_summary:
                         metadata = {
@@ -814,26 +918,32 @@ class DoclingDocumentParser(DocumentParser):
                         }
                         # Images get +0.5 offset to appear right after preceding element
                         positioned_elements.append((position + 0.5, image_summary, metadata))
-                        
+
                         if self.verbose:
                             logger.info(f"Image summary at position {position + 0.5}: {image_summary[:MAX_VERBOSE_LENGTH]}...")
                 else:
                     logger.info("Failed to retrieve image")
-        
-        # Apply chunking if needed
+
+        # Process tables before releasing doc (tables need doc.tables)
+        tables = []
+        if self.parse_tables:
+            if self.enable_gmft and filename.endswith('.pdf'):
+                tables = list(self.get_tables_with_gmft(filename))
+            else:
+                tables = list(self._get_tables(doc.tables, doc))
+
+        # Apply chunking if needed (chunker.chunk needs doc)
         if self.chunking_strategy in ['hybrid', 'hierarchical']:
             # Need to apply chunking to text elements only
             chunker = (
-                HybridChunker(max_tokens=self.chunk_size) 
+                HybridChunker(max_tokens=self.chunk_size)
                 if self.chunking_strategy == 'hybrid' else HierarchicalChunker()
             )
-            
+
             # Extract text elements, chunk them, then re-insert
-            non_text_elements = [(pos, content, meta) for pos, content, meta in positioned_elements 
+            non_text_elements = [(pos, content, meta) for pos, content, meta in positioned_elements
                                if meta['element_type'] != 'text']
-            
-            # Build a document-like structure for chunking
-            # Note: This is a simplified approach - may need refinement based on Docling's chunking API
+
             chunked_text_elements = []
             for chunk in chunker.chunk(doc):
                 metadata = {'element_type': 'text'}
@@ -842,26 +952,22 @@ class DoclingDocumentParser(DocumentParser):
                     metadata['page'] = page_no
                 else:
                     metadata['page'] = 0
-                    
+
                 # Assign positions based on page
                 base_position = metadata['page'] * 1000
                 position = base_position + len([e for e in chunked_text_elements if e[2]['page'] == metadata['page']])
                 chunked_text_elements.append((position, chunker.serialize(chunk=chunk), metadata))
-            
+
             # Combine chunked text with non-text elements
             positioned_elements = chunked_text_elements + non_text_elements
-        
+
+        # Release heavy Docling objects now that extraction is complete
+        del doc, res, all_items, items_list
+        gc.collect()
+
         # Sort all elements by position to maintain document order
         positioned_elements.sort(key=lambda x: x[0])
         content_stream = [(content, metadata) for _, content, metadata in positioned_elements]
-
-        # Process tables
-        tables = []
-        if self.parse_tables:
-            if self.enable_gmft and filename.endswith('.pdf'):
-                tables = list(self.get_tables_with_gmft(filename))
-            else:
-                tables = list(self._get_tables(doc.tables))
 
         # Fallback to filename if no title found
         if not doc_title:
@@ -869,15 +975,40 @@ class DoclingDocumentParser(DocumentParser):
             doc_title = os.path.splitext(basename)[0].replace('_', ' ').replace('-', ' ').title()
             logger.info(f"No title found in document, using filename fallback: '{doc_title}' for file {filename}")
 
-        logger.info(f"DoclingParser: {len(content_stream)} content elements, {len(tables)} tables")
-        logger.info(f"parsing file {filename} with Docling took {time.time()-st:.2f} seconds")
-
         return ParsedDocument(
             title=doc_title,
             content_stream=content_stream,
             tables=tables,
             image_bytes=image_bytes
         )
+
+    def parse(self, filename: str, source_url: str = "No URL") -> ParsedDocument:
+        """
+        Parse a local file and return unified content stream with images interleaved in proper order.
+        Tables are extracted separately for structured indexing.
+        Uses position-based ordering to maintain document structure.
+
+        When ``fallback_ocr`` is enabled and the initial (non-OCR) parse of a PDF
+        yields no meaningful text, the file is automatically re-parsed with OCR.
+        """
+        st = time.time()
+
+        converter = self._get_or_create_converter()
+        result = self._parse_with_converter(filename, source_url, converter)
+
+        # Fallback: if content stream is empty for a PDF, retry with OCR
+        if (self.fallback_ocr
+                and not self.do_ocr
+                and filename.lower().endswith('.pdf')
+                and not result.content_stream):
+            logger.info(f"No content elements found in {filename}, retrying with OCR fallback")
+            ocr_converter = self._get_or_create_converter(fallback_ocr=True)
+            result = self._parse_with_converter(filename, source_url, ocr_converter)
+
+        logger.info(f"DoclingParser: {len(result.content_stream)} content elements, {len(result.tables)} tables")
+        logger.info(f"parsing file {filename} with Docling took {time.time()-st:.2f} seconds")
+
+        return result
 
 
 
@@ -989,7 +1120,8 @@ class UnstructuredDocumentParser(DocumentParser):
         parse_tables: bool = False,
         enable_gmft: bool = False,
         summarize_images: bool = False,
-        image_context: dict = None
+        image_context: dict = None,
+        hi_res_model_name: str = "yolox"
     ):
         super().__init__(
             cfg=cfg,
@@ -1003,8 +1135,9 @@ class UnstructuredDocumentParser(DocumentParser):
         self.chunking_strategy = chunking_strategy     # none, by_title or basic
         self.chunk_size = chunk_size
         self.image_context = image_context or {'num_previous_chunks': 1, 'num_next_chunks': 1}
+        self.hi_res_model_name = hi_res_model_name
         if self.verbose:
-            logger.info(f"Using UnstructuredDocumentParser with chunking strategy '{self.chunking_strategy}' and chunk size {self.chunk_size}")
+            logger.info(f"Using UnstructuredDocumentParser with chunking strategy '{self.chunking_strategy}', chunk size {self.chunk_size}, hi_res_model_name '{self.hi_res_model_name}'")
 
     def _get_elements(
         self,
@@ -1036,7 +1169,7 @@ class UnstructuredDocumentParser(DocumentParser):
                 'extract_images_in_pdf': True,
                 'extract_image_block_types': ["Image", "Table"],
                 'strategy': "hi_res",
-                'hi_res_model_name': "yolox",
+                'hi_res_model_name': self.hi_res_model_name,
             })
 
         if mime_type == 'application/pdf':
@@ -1174,6 +1307,7 @@ class UnstructuredDocumentParser(DocumentParser):
                                 
                                 if image_path:
                                     # Store image binary data
+                                    image_binary = None
                                     if os.path.exists(image_path):
                                         with open(image_path, 'rb') as fp:
                                             image_binary = fp.read()
@@ -1181,14 +1315,15 @@ class UnstructuredDocumentParser(DocumentParser):
                                         image_bytes.append((image_id, image_binary))
                                     else:
                                         image_id = None
-                                        
+
                                     image_summary = self.image_summarizer.summarize_image(
-                                        image_path, source_url, previous_text, next_text
+                                        image_path, source_url, previous_text, next_text,
+                                        image_bytes=image_binary
                                     )
                                     if image_summary:
                                         position = base_position + idx + 0.5  # Images get +0.5 offset
                                         metadata = {
-                                            'element_type': 'image', 
+                                            'element_type': 'image',
                                             'page': page_num,
                                             'image_id': image_id
                                         }
@@ -1285,6 +1420,7 @@ class UnstructuredDocumentParser(DocumentParser):
                                 
                                 if image_path:
                                     # Store image binary data
+                                    image_binary = None
                                     if os.path.exists(image_path):
                                         with open(image_path, 'rb') as fp:
                                             image_binary = fp.read()
@@ -1292,23 +1428,24 @@ class UnstructuredDocumentParser(DocumentParser):
                                         image_bytes.append((image_id, image_binary))
                                     else:
                                         image_id = None
-                                        
+
                                     image_summary = self.image_summarizer.summarize_image(
-                                        image_path, source_url, previous_text, next_text
+                                        image_path, source_url, previous_text, next_text,
+                                        image_bytes=image_binary
                                     )
                                     if image_summary:
                                         # Use position from raw element + 0.5 for images
                                         position = base_position + idx + 0.5
                                         metadata = {
-                                            'element_type': 'image', 
+                                            'element_type': 'image',
                                             'page': page_num,
                                             'image_id': image_id
                                         }
                                         positioned_elements.append((position, image_summary, metadata))
-                                        
+
                                         if self.verbose:
                                             logger.info(f"Image summary at position {position}: {image_summary[:MAX_VERBOSE_LENGTH]}...")
-                                
+
                                 else:
                                     logger.warning("Image element found but no valid image path available")
                             except Exception as exc:
@@ -1361,6 +1498,12 @@ class UnstructuredDocumentParser(DocumentParser):
                 # Use raw elements for table extraction when chunking
                 table_elements = raw_tables_images if is_chunking else elements
                 tables = list(self._get_tables(table_elements))
+
+        # Release heavy element lists now that extraction is complete
+        del raw_tables_images, elements
+        if is_chunking:
+            del raw_elements, chunked_elements
+        gc.collect()
 
         logger.info(f"UnstructuredParser: {len(content_stream)} content elements, {len(tables)} tables")
         logger.info(f"parsing file {filename} with unstructured.io took {time.time()-st:.2f} seconds")
