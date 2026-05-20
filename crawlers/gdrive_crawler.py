@@ -1,6 +1,7 @@
 import io
 import json
 import logging
+import mimetypes
 import os
 import re
 import warnings
@@ -9,7 +10,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import ray
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, ListConfig
 from slugify import slugify
 
 from google.auth.transport.requests import Request
@@ -45,13 +46,14 @@ _PERM_FIELDS = (
     'permissions(id,type,role,emailAddress,domain,deleted,displayName,permissionDetails)'
 )
 
-# Legacy crawl-time displayName gate, preserved for backward compatibility.
-# Files are indexed only if one of their permissions has a matching displayName.
-# Set the config key to null/[] to disable and rely solely on ABAC metadata.
-DEFAULT_PERMISSION_DISPLAY_FILTER = ['Vectara', 'all']
+# Legacy crawl-time displayName gate, opt-in. When configured, files are
+# indexed only if one of their permissions has a matching displayName. The
+# default is unset (None) so every file the delegated user can read flows
+# through; tenants that want ACL-style gating should configure ABAC instead.
 
 # Values for the acl_source metadata field. Persisted in the corpus, so stable.
 ACL_SOURCE_SHARED_DRIVE = 'shared_drive'
+ACL_SOURCE_SHARED_DRIVE_PARTIAL = 'shared_drive_partial'
 ACL_SOURCE_MY_DRIVE_DIRECT = 'my_drive_direct'
 ACL_SOURCE_MY_DRIVE_RESOLVED = 'my_drive_resolved'
 ACL_SOURCE_MY_DRIVE_PARTIAL = 'my_drive_partial'
@@ -71,6 +73,44 @@ def extract_folder_id(value: Optional[str]) -> Optional[str]:
         return value
     m = _FOLDER_ID_PATTERN.search(value)
     return m.group(1) if m else value.strip()
+
+
+def resolve_root_folders(value: Any) -> List[str]:
+    """Normalize `gdrive_crawler.root_folder` into a list of folder ids.
+
+    Accepts either a single string (URL or bare id) or a list of strings,
+    so a single config key can scope the crawl to one folder, a Shared Drive
+    id, or any combination. Misconfigured scalars (int, dict, etc.) raise
+    TypeError — the same loud-fail pattern as the displayName gate; an
+    empty crawl is harder to debug than a startup exception.
+    """
+    if value is None or value == "" or value == []:
+        return []
+    if isinstance(value, str):
+        items: List[Any] = [value]
+    elif isinstance(value, (list, tuple, ListConfig)):
+        # OmegaConf wraps YAML lists as ListConfig, not list. Without it here
+        # a multi-root YAML config crashes the crawler at __init__.
+        items = list(value)
+    else:
+        raise TypeError(
+            "gdrive_crawler.root_folder must be a string or list of strings, "
+            f"got {type(value).__name__}"
+        )
+
+    seen: Set[str] = set()
+    out: List[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            raise TypeError(
+                "gdrive_crawler.root_folder list entries must be strings, "
+                f"got {type(item).__name__}"
+            )
+        fid = extract_folder_id(item)
+        if fid and fid not in seen:
+            seen.add(fid)
+            out.append(fid)
+    return out
 
 
 def build_scopes(abac_cfg: Optional[Any] = None) -> List[str]:
@@ -250,6 +290,22 @@ def extract_acl_metadata(
     }
 
 
+# Buckets reported in the per-user filter summary. Order is the order files
+# traverse the pipeline; keeping it stable makes log diffs across runs easy
+# to compare. `listed` is files returned by Drive (post-server-query); each
+# subsequent bucket is a drop reason; `indexed` is the terminal success.
+FILTER_STAGES = (
+    'listed',
+    'display_name_dropped',
+    'cache_skipped',
+    'mime_dropped',
+    'unsupported_ext_dropped',
+    'download_failed',
+    'index_error',
+    'indexed',
+)
+
+
 class UserWorker(object):
     def __init__(
             self,
@@ -282,16 +338,32 @@ class UserWorker(object):
         self._abac_include_anyone = self.abac.get('include_anyone', True)
         self._abac_fetch_labels = self.abac.get('fetch_labels', False)
 
-        # Optional: restrict the crawl to a subtree rooted at this folder.
+        # Optional: restrict the crawl to one or more subtrees. Accepts either
+        # a single Drive folder URL/id (legacy form) or a list of them, so a
+        # config can mix a My-Drive folder with a Shared Drive id without
+        # needing a second config key. Empty/unset means "sweep everything
+        # the delegated user can see," as before.
         root_folder_raw = (
             self.cfg.gdrive_crawler.get('root_folder', None)
             if hasattr(self.cfg, 'gdrive_crawler') else None
         )
-        self._root_folder_id = extract_folder_id(root_folder_raw) if root_folder_raw else None
+        self._root_folder_ids = resolve_root_folders(root_folder_raw)
 
         # Caches populated during a worker's lifetime
         self._folder_acl_cache: Dict[str, Tuple[List[Dict[str, Any]], List[str]]] = {}
+        # Per-Shared-Drive cache of (drive-level permissions, acl_source).
+        # The source is cached too so a failed permissions.list (e.g. 403 when
+        # the delegated user lacks fileOrganizer on the drive) doesn't get
+        # retried once per file in that drive.
+        self._drive_perms_cache: Dict[str, Tuple[List[Dict[str, Any]], str]] = {}
         self._label_defs: Optional[Dict[str, Dict[str, Any]]] = None
+
+        # Per-user filter pipeline counters. Reset at the start of process();
+        # incremented by _record_drop()/_record_indexed() as files traverse the
+        # gates documented in CRAWLERS.md. A summary is logged when process()
+        # returns so operators can see how many files were dropped at each
+        # stage (most opaque drop today is the display-name gate).
+        self._stats: Dict[str, int] = {k: 0 for k in FILTER_STAGES}
 
         # Standalone images are routed through the indexer's ImageFileParser,
         # but only when a vision-capable summarizer is enabled. Gating on this
@@ -320,6 +392,67 @@ class UserWorker(object):
         allow = set(self.permission_display_filter)
         return any(p.get('displayName') in allow for p in permissions)
 
+    def _record_drop(self, bucket: str, file_obj: Dict[str, Any], reason: str) -> None:
+        """Increment a drop counter and emit an INFO line so the operator can
+        see exactly which file was filtered and why. Cheap enough to do for
+        every drop — Drive crawls are network-bound, not log-bound.
+        """
+        if bucket not in self._stats:
+            raise KeyError(f"unknown filter bucket: {bucket}")
+        self._stats[bucket] += 1
+        logger.info(
+            f"gdrive filter drop [{bucket}] file='{file_obj.get('name', '?')}' "
+            f"id={file_obj.get('id', '?')} mime={file_obj.get('mimeType', '?')} :: {reason}"
+        )
+
+    def _record_indexed(
+        self,
+        file_obj: Dict[str, Any],
+        file_metadata: Optional[Dict[str, Any]] = None,
+        parent_permissions: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        self._stats['indexed'] += 1
+        # Per-file success line is gated behind verbose: on large corpora the
+        # summary counter is the signal operators want, and one INFO per
+        # indexed file dominates log volume on healthy runs.
+        if not self.crawler.verbose:
+            return
+
+        line = (
+            f"gdrive indexed file='{file_obj.get('name', '?')}' "
+            f"id={file_obj.get('id', '?')}"
+        )
+        # Raw permissions are logged independent of ABAC so operators can debug
+        # acl_* derivation (or just inspect what Drive returned) even with ABAC
+        # off. parent_permissions is appended only when non-empty to keep the
+        # line tight for Shared Drive files and non-resolve_inherited runs.
+        line += f" permissions={file_obj.get('permissions', [])!r}"
+        if parent_permissions:
+            line += f" parent_permissions={parent_permissions!r}"
+        # When ABAC is on, append the resolved acl_* values so operators can
+        # confirm per-file what the indexer actually shipped to the corpus
+        # (inheritance source, public/org-wide flags, group/domain grants,
+        # labels). Order is stable for grep-ability.
+        if self._abac_enabled and file_metadata is not None:
+            acl_keys = (
+                'acl_source',
+                'acl_is_public',
+                'acl_is_org_wide',
+                'acl_owners',
+                'acl_readers',
+                'acl_groups',
+                'acl_domains',
+                'acl_labels',
+            )
+            line += ' ' + ' '.join(
+                f"{k}={file_metadata[k]!r}" for k in acl_keys if k in file_metadata
+            )
+        logger.info(line)
+
+    def _log_filter_summary(self, user: str) -> None:
+        parts = ' '.join(f"{k}={self._stats[k]}" for k in FILTER_STAGES)
+        logger.info(f"gdrive filter summary for user={user} :: {parts}")
+
     def list_files(self, service: Resource, date_threshold: Optional[str] = None) -> List[dict]:
         results = []
         page_token = None
@@ -345,8 +478,15 @@ class UserWorker(object):
                 files = response.get('files', [])
 
                 for file in files:
+                    self._stats['listed'] += 1
                     if self._passes_display_filter(file.get('permissions', [])):
                         results.append(file)
+                    else:
+                        self._record_drop(
+                            'display_name_dropped',
+                            file,
+                            f"no permission displayName matched {self.permission_display_filter}",
+                        )
                 page_token = response.get('nextPageToken', None)
                 if not page_token:
                     break
@@ -409,8 +549,15 @@ class UserWorker(object):
                             elif mime == SHORTCUT_MIME:
                                 continue
                             else:
+                                self._stats['listed'] += 1
                                 if self._passes_display_filter(f.get('permissions', [])):
                                     results.append(f)
+                                else:
+                                    self._record_drop(
+                                        'display_name_dropped',
+                                        f,
+                                        f"no permission displayName matched {self.permission_display_filter}",
+                                    )
 
                         page_token = response.get('nextPageToken')
                         if not page_token:
@@ -424,14 +571,98 @@ class UserWorker(object):
             frontier = next_frontier
         return results
 
-    def _resolve_parent_acl(self, file_obj: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
-        """Resolve inherited permissions for My Drive files by walking parent folders.
+    def _collect_listable_files(self, date_threshold_str: str) -> List[dict]:
+        """Initial listing dispatch.
 
-        Returns (union of ancestor permissions, source discriminator).
+        With no `root_folder` configured, fall back to the user-wide
+        list_files() sweep. With one or more configured, walk each subtree
+        and union the results, deduping by file id so a document that lives
+        under two configured roots (e.g. via shortcut) is indexed only once.
         """
-        # Shared Drive files already receive inherited permissions on the file itself.
-        if file_obj.get('driveId'):
-            return [], ACL_SOURCE_SHARED_DRIVE
+        if not self._root_folder_ids:
+            return self.list_files(self.service, date_threshold=date_threshold_str)
+
+        seen: Set[str] = set()
+        out: List[dict] = []
+        for root_id in self._root_folder_ids:
+            logger.info(f"Restricting crawl to folder subtree: {root_id}")
+            for f in self._list_subtree(self.service, root_id, date_threshold_str):
+                fid = f.get('id')
+                if fid and fid not in seen:
+                    seen.add(fid)
+                    out.append(f)
+        return out
+
+    def _fetch_drive_permissions(self, drive_id: str) -> Tuple[List[Dict[str, Any]], str]:
+        """Return (members, source) for a Shared Drive, with per-worker caching.
+
+        Drive's `files.list` does not propagate drive-level member grants onto
+        a file's `permissions` array — so a Shared Drive file whose access is
+        purely inherited from the drive comes back from list() with
+        `permissions=[]`, which downstream renders as an empty acl_*. To
+        recover the true ACL we fetch `permissions.list(fileId=<driveId>)`
+        once per drive and let the caller merge those grants in.
+
+        Caveat: enumerating a Shared Drive's full member list requires the
+        delegated user to have at least the `fileOrganizer` role on that
+        drive. Lower roles get a 403; we mark the source as
+        `shared_drive_partial` and cache that outcome so we don't hammer
+        Drive once per file. Sub-folder-level overrides within the drive
+        are out of scope here — they would need an ancestor walk like the
+        My Drive path, which is the existing `_folder_acl_cache` flow.
+        """
+        cached = self._drive_perms_cache.get(drive_id)
+        if cached is not None:
+            return cached
+
+        fields = (
+            'nextPageToken,' + _PERM_FIELDS
+        )
+        collected: List[Dict[str, Any]] = []
+        source = ACL_SOURCE_SHARED_DRIVE
+        page_token: Optional[str] = None
+        while True:
+            params = {
+                'fileId': drive_id,
+                'supportsAllDrives': True,
+                'fields': fields,
+            }
+            if page_token:
+                params['pageToken'] = page_token
+            try:
+                resp = self.service.permissions().list(**params).execute()
+            except HttpError as e:
+                logger.info(f"permissions.list failed for shared drive {drive_id}: {e}")
+                collected = []
+                source = ACL_SOURCE_SHARED_DRIVE_PARTIAL
+                break
+            except Exception as e:
+                logger.info(f"Error listing permissions for shared drive {drive_id}: {e}")
+                collected = []
+                source = ACL_SOURCE_SHARED_DRIVE_PARTIAL
+                break
+
+            for p in (resp.get('permissions') or []):
+                collected.append(p)
+            page_token = resp.get('nextPageToken')
+            if not page_token:
+                break
+
+        self._drive_perms_cache[drive_id] = (collected, source)
+        return collected, source
+
+    def _resolve_parent_acl(self, file_obj: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
+        """Resolve inherited permissions for a file.
+
+        For Shared Drive files: fetch the drive's member list (cached per
+        worker per drive). For My Drive files with `resolve_inherited=True`:
+        walk ancestor folders and union their ACLs.
+
+        Returns (union of inherited permissions, source discriminator).
+        """
+        drive_id = file_obj.get('driveId')
+        if drive_id:
+            return self._fetch_drive_permissions(drive_id)
 
         if not self._abac_resolve_inherited:
             return [], ACL_SOURCE_MY_DRIVE_DIRECT
@@ -578,7 +809,7 @@ class UserWorker(object):
                         out.append(f"{label_title}={v}")
         return out
 
-    def download_or_export_file(self, file_id: str, mime_type: Optional[str] = None) -> Optional[io.BytesIO]:
+    def download_or_export_file(self, file_id: str, mime_type: Optional[str] = None) -> Tuple[Optional[io.BytesIO], Optional[str]]:
         try:
             if mime_type:
                 request = self.service.files().export_media(fileId=file_id, mimeType=mime_type)
@@ -591,7 +822,7 @@ class UserWorker(object):
             while not done:
                 _, done = downloader.next_chunk()
             byte_stream.seek(0)
-            return byte_stream
+            return byte_stream, None
 
         except HttpError as error:
             if error.resp.status == 403 and \
@@ -609,27 +840,36 @@ class UserWorker(object):
                         pdf_response = requests.get(pdf_link, headers=headers)
                         if pdf_response.status_code == 200:
                             logger.info(f"Downloaded file {file_id} via link (as pdf)")
-                            return io.BytesIO(pdf_response.content)
+                            return io.BytesIO(pdf_response.content), None
                         else:
+                            reason = f"export link returned HTTP {pdf_response.status_code}"
                             logger.error(f"An error occurred loading via link: {pdf_response.status_code}")
-            else:
-                logger.error(f"An error occurred downloading file: {error}")
+                            return None, reason
+                    return None, "no application/pdf export link available"
+                return None, f"exportLinks lookup returned HTTP {response.status_code}"
+            reason = f"HttpError {error.resp.status}: {error}"
+            logger.error(f"An error occurred downloading file: {error}")
+            return None, reason
 
-            return None
-
-    def save_local_file(self, file_id: str, name: str, mime_type: Optional[str] = None) -> Optional[str]:
+    def save_local_file(
+        self, file_id: str, name: str, mime_type: Optional[str] = None
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Download a Drive file to /tmp. Returns (local_path, error_reason);
+        on success error_reason is None, on failure local_path is None and
+        error_reason names the failing stage so callers can surface it."""
         path, extension = os.path.splitext(name)
         sanitized_name = f"{slugify(path)}{extension}"
         file_path = os.path.join("/tmp", sanitized_name)
         try:
-            byte_stream = self.download_or_export_file(file_id, mime_type)
-            if byte_stream:
-                with open(file_path, 'wb') as f:
-                    f.write(byte_stream.read())
-                return file_path
+            byte_stream, download_reason = self.download_or_export_file(file_id, mime_type)
+            if byte_stream is None:
+                return None, download_reason or "download_or_export_file returned no bytes"
+            with open(file_path, 'wb') as f:
+                f.write(byte_stream.read())
+            return file_path, None
         except Exception as e:
             logger.warning(f"Error saving local file: {e}")
-        return None
+            return None, f"local file write failed: {e}"
 
     def crawl_file(self, file: dict) -> None:
         file_id = file['id']
@@ -638,15 +878,25 @@ class UserWorker(object):
 
         url = get_gdrive_url(file_id, mime_type)
         if mime_type == 'application/vnd.google-apps.document':
-            local_file_path = self.save_local_file(file_id, name + '.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+            local_file_path, download_error = self.save_local_file(file_id, name + '.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
         elif mime_type == 'application/vnd.google-apps.presentation':
-            local_file_path = self.save_local_file(file_id, name + '.pptx', 'application/vnd.openxmlformats-officedocument.presentationml.presentation')
+            local_file_path, download_error = self.save_local_file(file_id, name + '.pptx', 'application/vnd.openxmlformats-officedocument.presentationml.presentation')
         elif mime_type == 'application/vnd.google-apps.spreadsheet':
-            local_file_path = self.save_local_file(file_id, name + '.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            local_file_path, download_error = self.save_local_file(file_id, name + '.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
         else:
-            local_file_path = self.save_local_file(file_id, name)
+            # Drive often surfaces files without a filename extension (e.g. a PDF
+            # uploaded with just a title). The mime type is authoritative — use it
+            # to synthesize the extension so the downstream filter at line 765 can
+            # route the file.
+            name_for_save = name
+            if mime_type and not os.path.splitext(name)[1]:
+                guessed_ext = mimetypes.guess_extension(mime_type)
+                if guessed_ext:
+                    name_for_save = name + guessed_ext
+            local_file_path, download_error = self.save_local_file(file_id, name_for_save)
 
         if not local_file_path:
+            self._record_drop('download_failed', file, download_error or "unknown save_local_file failure")
             return
 
         # Route by type: dataframes go through DataframeParser; images use the
@@ -657,7 +907,12 @@ class UserWorker(object):
             supported_extensions += ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff', '.tif', '.svg', '.ico', '.eps']
 
         is_dataframe = supported_by_dataframe_parser(local_file_path)
-        if not is_dataframe and not any(local_file_path.endswith(ext) for ext in supported_extensions):
+        if not is_dataframe and not any(local_file_path.lower().endswith(ext) for ext in supported_extensions):
+            self._record_drop(
+                'unsupported_ext_dropped',
+                file,
+                f"local path {local_file_path!r} not in supported extensions {supported_extensions}",
+            )
             safe_remove_file(local_file_path)
             return
 
@@ -682,6 +937,7 @@ class UserWorker(object):
             'source': 'gdrive'
         }
 
+        parent_perms: Optional[List[Dict[str, Any]]] = None
         if self._abac_enabled:
             parent_perms, source = self._resolve_parent_acl(file)
 
@@ -699,7 +955,7 @@ class UserWorker(object):
 
         try:
             if is_dataframe:
-                process_dataframe_file(
+                ok = process_dataframe_file(
                     file_path=local_file_path,
                     metadata=file_metadata,
                     doc_id=file_id,
@@ -707,15 +963,31 @@ class UserWorker(object):
                     df_config=self.cfg.get('dataframe_processing', {}),
                     source_name='gdrive',
                 )
+                if ok:
+                    self._record_indexed(file, file_metadata, parent_permissions=parent_perms)
+                else:
+                    reason = self.df_parser.last_error or "process_dataframe_file returned False"
+                    self._record_drop('index_error', file, reason)
             else:
-                self.indexer.index_file(filename=local_file_path, uri=url, metadata=file_metadata)
+                ok = self.indexer.index_file(filename=local_file_path, uri=url, metadata=file_metadata)
+                if ok:
+                    self._record_indexed(file, file_metadata, parent_permissions=parent_perms)
+                else:
+                    reason = self.indexer.last_error or "indexer.index_file returned False"
+                    self._record_drop('index_error', file, reason)
         except Exception as e:
             logger.warning(f"Error {e} indexing document for file {name}, file_id {file_id}")
+            self._record_drop('index_error', file, f"exception: {e}")
 
         safe_remove_file(local_file_path)
 
     def process(self, user: str) -> None:
         logger.info(f"Processing files for user: {user}")
+
+        # Reset per-user filter counters so each call to process() yields a
+        # clean summary line. With Ray, this matters because the same actor
+        # services multiple users sequentially.
+        self._stats = {k: 0 for k in FILTER_STAGES}
 
         # Determine authentication method based on configuration
         auth_type = self.cfg.gdrive_crawler.get("auth_type", "service_account")
@@ -744,17 +1016,21 @@ class UserWorker(object):
         self.service = build("drive", "v3", credentials=self.creds, cache_discovery=False)
 
         date_threshold_str = self.date_threshold.isoformat() + 'Z'
-        if self._root_folder_id:
-            logger.info(f"Restricting crawl to folder subtree: {self._root_folder_id}")
-            files = self._list_subtree(self.service, self._root_folder_id, date_threshold_str)
-        else:
-            files = self.list_files(self.service, date_threshold=date_threshold_str)
-        if self.use_ray:
-            files = [file for file in files if not ray.get(self.shared_cache.contains.remote(file['id']))]
-        else:
-            files = [file for file in files if not self.shared_cache.contains(file['id'])]
+        files = self._collect_listable_files(date_threshold_str)
 
-        # remove mime types we don't want to crawl
+        # Cache gate: drop files already crawled by another user/worker.
+        def _already_seen(file_id: str) -> bool:
+            return (ray.get(self.shared_cache.contains.remote(file_id))
+                    if self.use_ray else self.shared_cache.contains(file_id))
+        kept: List[dict] = []
+        for f in files:
+            if _already_seen(f['id']):
+                self._record_drop('cache_skipped', f, "already crawled in this run")
+            else:
+                kept.append(f)
+        files = kept
+
+        # MIME prefix gate: drop file types the parsers won't handle.
         mime_prefix_to_remove = [
             'audio', 'video',
             'application/vnd.google-apps.folder', 'application/x-adobe-indesign',
@@ -764,10 +1040,17 @@ class UserWorker(object):
         ]
         if not self._summarize_images:
             mime_prefix_to_remove.append('image')
-        files = [file for file in files if not any(file['mimeType'].startswith(mime_type) for mime_type in mime_prefix_to_remove)]
+        kept = []
+        for f in files:
+            matched = next((p for p in mime_prefix_to_remove if f['mimeType'].startswith(p)), None)
+            if matched is not None:
+                self._record_drop('mime_dropped', f, f"mimeType starts with blocked prefix '{matched}'")
+            else:
+                kept.append(f)
+        files = kept
 
         if self.crawler.verbose:
-            logging.info(f"identified {len(files)} files for user {user}")
+            logger.info(f"identified {len(files)} files for user {user} (post mime/cache gates)")
 
         # get access token
         try:
@@ -775,6 +1058,7 @@ class UserWorker(object):
             self.access_token = self.creds.token
         except Exception as e:
             logger.warning(f"Error refreshing token: {e} for user {user}")
+            self._log_filter_summary(user)
             return
 
         for file in files:
@@ -785,6 +1069,8 @@ class UserWorker(object):
                 if not self.shared_cache.contains(file['id']):
                     self.shared_cache.add(file['id'])
             self.crawl_file(file)
+
+        self._log_filter_summary(user)
 
 class GdriveCrawler(Crawler):
 
@@ -799,13 +1085,18 @@ class GdriveCrawler(Crawler):
         if auth_type == "oauth":
             self.delegated_users = ["oauth_user"]  # Dummy user for OAuth mode
         else:
+            if "delegated_users" not in cfg.gdrive_crawler:
+                raise ValueError(
+                    "gdrive_crawler.delegated_users is required for auth_type='service_account'. "
+                    "Provide a list of user emails to impersonate, or set auth_type: oauth."
+                )
             self.delegated_users = cfg.gdrive_crawler.delegated_users
 
     def _resolve_permission_display_filter(self) -> Optional[List[str]]:
         """Read the crawl-time displayName gate, honoring the deprecated 'permissions' key.
 
-        Returns None when the gate is disabled (config null or empty list), else
-        the list of allowed displayName strings.
+        Returns None when the gate is disabled (config null, empty list, or
+        unset — the default), else the list of allowed displayName strings.
         """
         gdrive = self.cfg.gdrive_crawler
         if 'permission_display_filter' in gdrive:
@@ -818,7 +1109,7 @@ class GdriveCrawler(Crawler):
             )
             value = gdrive.get('permissions')
         else:
-            value = list(DEFAULT_PERMISSION_DISPLAY_FILTER)
+            return None
 
         if value is None:
             return None

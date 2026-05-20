@@ -634,7 +634,9 @@ HUBSPOT_API_KEY = "your-private-app-key"
 
     # Crawl-time filters
     days_back: 7
-    permission_display_filter: ['Vectara', 'all']
+    # Optional crawl-time displayName gate (default: unset, i.e. no filter).
+    # When set, files are kept only if a permission's displayName matches.
+    # permission_display_filter: ['Vectara', 'all']
 
     # Optional: restrict the crawl to a folder subtree
     # root_folder: https://drive.google.com/drive/folders/<folder_id>
@@ -661,8 +663,8 @@ The gdrive crawler indexes content from Google Drive with support for two authen
 - `auth_type`: `service_account` (default) or `oauth`. See "Authentication Methods" below.
 - `credentials_file`: path to the credentials JSON file. The exact contents depend on `auth_type` (service-account JSON vs. OAuth token JSON).
 - `days_back`: include only files modified within the last N days. **Default: 7.**
-- `permission_display_filter`: list of permission `displayName` values to include. A file is indexed only if at least one of its Drive permissions has a matching `displayName` (a typical pattern is your company name, e.g. `Vectara`, plus `all` to admit files shared with `anyone`/the whole organization, since those grants are surfaced with `displayName: "all"`). Set to `null` or `[]` to disable this crawl-time gate and rely solely on ABAC metadata + query-time filters. **Default: `['Vectara', 'all']`.** The legacy key `permissions` is still honored but deprecated — rename it to `permission_display_filter`.
-- `root_folder` (optional): restrict the crawl to a single folder and all of its descendants. Accepts either a Drive folder URL (e.g. `https://drive.google.com/drive/folders/<id>`) or the bare folder id. When unset, the crawler sweeps `root`, `sharedWithMe`, and files owned/shared with each delegated user. `days_back` still applies to leaf files; subfolders are always traversed so old folders containing recent files are not missed. Shortcuts inside the subtree are not followed, so the crawl stays strictly within the chosen folder.
+- `permission_display_filter`: optional list of permission `displayName` values to include. When set, a file is indexed only if at least one of its Drive permissions has a matching `displayName` (a typical pattern would be your company name plus `all` to admit files shared with `anyone`/the whole organization, since those grants are surfaced with `displayName: "all"`). **Default: unset (no filter)** — every file the delegated user can read flows through; use ABAC metadata for access control. Set to `null` or `[]` explicitly to disable. The legacy key `permissions` is still honored but deprecated — rename it to `permission_display_filter`.
+- `root_folder` (optional): restrict the crawl to one or more subtrees. Accepts either a single Drive folder URL/id or a list of them, so a config can mix a My-Drive folder with a Shared Drive id in one run. Shared Drive ids are accepted (e.g. `https://drive.google.com/drive/folders/0AJb-TGGUWsU4Uk9PVA`). When unset, the crawler sweeps `root`, `sharedWithMe`, and files owned/shared with each delegated user. `days_back` still applies to leaf files; subfolders are always traversed so old folders containing recent files are not missed. Shortcuts inside a subtree are not followed, so the crawl stays strictly within the chosen folders. A file reachable from more than one configured root is indexed once.
 - `ray_workers`: `0` to disable Ray (default), `>0` to parallelize across `delegated_users` with that many Ray workers, `-1` to use all cores. Only meaningful for service-account mode with multiple users.
 
 **Authentication Methods:**
@@ -708,7 +710,7 @@ gdrive_crawler:
   auth_type: oauth
   credentials_file: credentials.json
   days_back: 7
-  permission_display_filter: ['Vectara', 'all']
+  # permission_display_filter: ['<your company>', 'all']   # opt-in; default is no filter
 ```
 
 **Attribute-Based Access Control (ABAC):**
@@ -724,11 +726,11 @@ When `abac.enabled: true`, every indexed document is tagged with filterable ACL 
 | `acl_is_public`   | Boolean   | `true` if the file is shared with `type=anyone` (and `include_anyone` is true).          |
 | `acl_is_org_wide` | Boolean   | `true` if any domain grant is present.                                                   |
 | `acl_labels`      | Text List | Drive Labels as `<LabelTitle>=<Value>` strings (only populated when `fetch_labels: true`). |
-| `acl_source`      | Text      | Provenance of the ACL: `shared_drive`, `my_drive_direct`, `my_drive_resolved`, or `my_drive_partial`. `shared_drive` and `my_drive_resolved` reflect a complete ACL; `my_drive_direct` and `my_drive_partial` may be missing inherited grants. |
+| `acl_source`      | Text      | Provenance of the ACL: `shared_drive`, `shared_drive_partial`, `my_drive_direct`, `my_drive_resolved`, or `my_drive_partial`. `shared_drive` and `my_drive_resolved` reflect a complete ACL; the two `*_partial` values mean Drive returned a permission error during inheritance resolution and the recorded grants may be incomplete; `my_drive_direct` is by design partial when `resolve_inherited: false`. |
 
 **ABAC sub-options:**
 - `abac.enabled`: emit `acl_*` metadata on every indexed document. Default: `false`.
-- `abac.resolve_inherited`: My Drive files don't receive inherited permissions via the API. When `true`, the crawler walks each file's parent folders and unions their ACLs (folder lookups are cached per worker; adds API round-trips). Shared Drive files already include inherited grants and are unaffected. Default: `false`.
+- `abac.resolve_inherited`: My Drive files don't receive inherited permissions via the API. When `true`, the crawler walks each file's parent folders and unions their ACLs (folder lookups are cached per worker; adds API round-trips). Shared Drive files are handled separately and unconditionally: Drive's `files.list` does **not** propagate Shared Drive member grants onto a file's `permissions` array, so the crawler issues one `permissions.list(fileId=<driveId>)` per drive (cached per worker) and merges those members into each file's ACL. This call requires the delegated user to have at least the `fileOrganizer` role on the drive; otherwise Drive returns 403 and the crawler tags the affected files `acl_source: shared_drive_partial` so operators can spot the gap. Default: `false`.
 - `abac.include_anyone`: treat `type=anyone` grants as public (sets `acl_is_public=true`). Default: `true`.
 - `abac.fetch_labels`: fetch Drive Labels per file and store them in `acl_labels`. Adds one round-trip per file plus one definitions fetch per worker, and requires the `drive.labels.readonly` OAuth scope (added automatically when this flag is on). Default: `false`.
 
@@ -737,6 +739,18 @@ When `abac.enabled: true`, every indexed document is tagged with filterable ACL 
 - Both authentication modes use the same `credentials_file` field, but the file's contents differ.
 - The OAuth token auto-refreshes and is rewritten back to `credentials_file` when it expires.
 - Audio, video, archives, executables, and source-code-style text files are skipped by mime type. Standalone images are skipped unless `doc_processing.summarize_images` is enabled.
+
+**Filter Pipeline:**
+
+Each file passes through several gates between Drive and the indexer. A drop at any stage is logged at INFO with the file name, id, mime type, and reason; a per-user summary line of the form `gdrive filter summary for user=<u> :: listed=N display_name_dropped=N cache_skipped=N mime_dropped=N unsupported_ext_dropped=N download_failed=N index_error=N indexed=N` is emitted when the user is done. The stages, in order:
+
+1. **Drive API query** — server-side `trashed=false AND modifiedTime > now - days_back`. Files outside the window are never returned by Drive and so are not counted.
+2. **`permission_display_filter`** — optional. When set, keeps a file only if some permission's `displayName` matches the allowlist. **Default: unset (no filter).** Use this only for legacy gating; prefer ABAC metadata + query-time filters for new deployments.
+3. **Shared cache** — when multiple `delegated_users` are crawled, the second-seen user skips files already indexed by the first.
+4. **MIME prefix blocklist** — `audio*`, `video*`, folders, `application/x-adobe-indesign`, `application/zip`, `application/x-rar-compressed`, `application/x-7z-compressed`, `application/x-executable`, `text/php|javascript|css|xml|x-sql|x-python-script`, and `image*` unless `doc_processing.summarize_images: true`.
+5. **Extension allowlist (post-download)** — file is rejected unless it's a dataframe (`.csv`, `.tsv`, `.psv`, `.pipe`, `.xls`, `.xlsx` — see `supported_by_dataframe_parser` in `core/dataframe_parser.py`) or extension is in `{.doc, .docx, .ppt, .pptx, .pdf, .odt, .txt, .html, .md, .rtf, .epub, .lxml}` (plus image extensions when `summarize_images` is on).
+6. **Download/export** — files whose Drive download or Workspace export fails (e.g. `exportSizeLimitExceeded` with no PDF fallback) are counted as `download_failed`.
+7. **Indexing** — `indexer.index_file` returning `False` or raising is counted as `index_error`; success is counted as `indexed`.
 
 
 ### Folder crawler
@@ -747,7 +761,7 @@ When `abac.enabled: true`, every indexed document is tagged with filterable ACL 
     path: "/Users/ofer/Downloads/some-interesting-content/"
     extensions: ['.pdf']
     source: 'my-folder'
-    metadata_file: '/path/to/metadata.csv'
+    metadata_file: 'metadata.csv'   # relative to `path` (e.g. 'subdir/meta.csv'); must NOT be absolute
     num_per_second: 10
     ray_workers: 0
 ```
@@ -757,7 +771,7 @@ The folder crawler walks a local folder **recursively** (`os.walk`) and indexes 
 - `path`: local folder to crawl. The path is bind-mounted into the Docker container at `/home/vectara/data` automatically.
 - `extensions`: list of file extensions to include. Use `["*"]` (the default if omitted) to include every file regardless of extension.
 - `source`: string added to each file's metadata under the `"source"` field.
-- `metadata_file`: optional CSV file for per-file metadata. Each row needs a `filename` column matching a file in the folder; the remaining columns become metadata. The metadata file must live inside `path` and is itself excluded from indexing.
+- `metadata_file`: optional CSV file for per-file metadata, given as a **relative path under `path`** (e.g. `metadata.csv` or `subdir/meta.csv`) — absolute paths will not resolve correctly. Each row needs a `filename` column matching a file in the folder; the remaining columns become metadata. The metadata file is itself excluded from indexing.
 - `num_per_second`: rate limit when indexing files in parallel. Default: `10`.
 - `ray_workers`: `0` disables Ray (default), `>0` parallelizes indexing across N workers, `-1` uses all CPU cores.
 
@@ -785,8 +799,8 @@ The S3 crawler indexes content under a given S3 path. AWS credentials are picked
 - `s3_path`: S3 URI of the form `s3://bucket/prefix` whose files should be indexed.
 - `extensions`: list of file extensions to include. Use `['*']` to include every file regardless of extension.
 - `metadata_file`: optional CSV file under the same `s3_path` providing per-file metadata. Each row needs a `filename` column matching an object key; remaining columns become metadata. The metadata file itself is excluded from indexing.
-- `aws_access_key_id` / `aws_secret_access_key`: optional. When set, used directly. Otherwise, boto3 credential resolution applies.
-- `endpoint_url`: optional. Use for S3-compatible services (MinIO, Cloudflare R2, Wasabi, etc.). Either credentials *or* an `endpoint_url` must resolve, otherwise the crawler errors out.
+- `aws_access_key_id` / `aws_secret_access_key`: optional, **must be set together or both omitted**. When set, used directly. Otherwise, the standard boto3 credential chain applies (env vars `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, shared config `~/.aws/credentials`, IAM role / EC2 instance metadata). If no credentials resolve, boto3 raises `NoCredentialsError` on the first S3 call.
+- `endpoint_url`: optional. Use for S3-compatible services (MinIO, Cloudflare R2, Wasabi, etc.). When omitted, boto3 talks to AWS S3 directly.
 - `num_per_second`: rate limit when downloading/indexing. Default: `10`.
 - `ray_workers`: `0` disables Ray (default), `>0` parallelizes across N workers, `-1` uses all CPU cores.
 - `source`: source label attached to each document's metadata. Default: `"S3"`.
