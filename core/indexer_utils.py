@@ -7,7 +7,7 @@ import json
 from typing import Dict, Any, Optional
 from email.utils import parsedate_to_datetime
 from datetime import datetime
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse, urlunparse
 from bs4 import BeautifulSoup
 from omegaconf import OmegaConf
 
@@ -215,11 +215,87 @@ def validate_text_content(text: str, min_length: int = 3) -> bool:
     return text is not None and len(text) >= min_length
 
 
+# Google adds /u/<digits>/ right after the host to indicate the active account
+# context when you're signed into multiple Google accounts. The same document
+# is served either way, so the segment is identity-irrelevant — strip it so
+# /u/0/d/X and /d/X don't churn through the corpus as separate docs.
+_GOOGLE_USER_PREFIX_RE = re.compile(r"^/u/\d+/")
+
+
 def normalize_url_for_metadata(url: str) -> str:
-    """Return URL-decoded version of URL for metadata storage"""
-    if url and isinstance(url, str):
-        return unquote(url)
-    return url
+    """URL-decode and strip Google's /u/N/ account-context segment."""
+    if not (url and isinstance(url, str)):
+        return url
+    decoded = unquote(url)
+    parsed = urlparse(decoded)
+    host = parsed.netloc.lower()
+    if (host == "google.com" or host.endswith(".google.com")) and _GOOGLE_USER_PREFIX_RE.match(parsed.path):
+        new_path = _GOOGLE_USER_PREFIX_RE.sub("/", parsed.path)
+        decoded = urlunparse(parsed._replace(path=new_path))
+    return decoded
+
+
+# Known identity-provider netlocs. Matched by equality OR as a suffix
+# preceded by '.' so subdomains like 'tenant.okta.com' are caught while
+# 'fakeokta.com' is not.
+_AUTH_NETLOCS = (
+    "accounts.google.com",
+    "login.microsoftonline.com",
+    "login.live.com",
+    "login.windows.net",
+    "signin.aws.amazon.com",
+    "auth0.com",
+    "okta.com",
+    "oktapreview.com",
+    "onelogin.com",
+    "pingone.com",
+)
+
+
+def auth_redirect_reason(original_url: str, final_url: str) -> Optional[str]:
+    """Detect that a fetch was bounced into a sign-in / identity-provider page.
+
+    Returns a short human-readable reason string when the netloc changed
+    during the fetch and the new netloc matches a known IDP; otherwise
+    returns None. The check is intentionally conservative: same-domain
+    /login redirects are not flagged, because some sites legitimately
+    serve login content under their own domain.
+    """
+    if not original_url or not final_url:
+        return None
+    try:
+        orig = urlparse(original_url).netloc.lower()
+        final = urlparse(final_url).netloc.lower()
+    except Exception:
+        return None
+    if not orig or not final or orig == final:
+        return None
+    for netloc in _AUTH_NETLOCS:
+        if final == netloc or final.endswith("." + netloc):
+            return f"redirected to identity-provider {final}"
+    return None
+
+
+def is_auth_host(url: str) -> bool:
+    """True if `url`'s host matches a known identity-provider netloc.
+
+    Use this to skip URLs that are sign-in / account-chooser pages reached
+    by a direct link (e.g. an `accounts.google.com/SignOutOptions` link
+    embedded in a partially-authenticated page), where `auth_redirect_reason`
+    does not fire because no netloc change occurred during the fetch.
+    """
+    if not url:
+        return False
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    for netloc in _AUTH_NETLOCS:
+        if host == netloc or host.endswith("." + netloc):
+            return True
+    return False
 
 
 def prepare_file_metadata(metadata: Dict[str, Any], filename: str, static_metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

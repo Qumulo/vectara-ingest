@@ -39,9 +39,9 @@ from core.image_processor import ImageProcessor
 
 
 from core.indexer_utils import (
-    get_chunking_config, extract_last_modified, create_upload_files_dict, 
+    get_chunking_config, extract_last_modified, create_upload_files_dict,
     handle_file_upload_response, safe_file_cleanup, prepare_file_metadata, store_file,
-    normalize_url_for_metadata
+    normalize_url_for_metadata, auth_redirect_reason
 )
 from core.web_extractor_base import create_web_extractor
 from core.file_processor import FileProcessor
@@ -81,6 +81,10 @@ class Indexer:
         # start of every index_file() call. Callers can read this after a False
         # return to enrich their drop/error records.
         self.last_error: Optional[str] = None
+        # When index_url skips a page because it was redirected to an IdP /
+        # sign-in form, this holds the reason string. Reset on every
+        # index_url call so callers can read it after a False return.
+        self.last_skip_reason: Optional[str] = None
         self.x_source = f'vectara-ingest-{self.cfg.crawling.crawler_type}'
         self.scrape_method = scrape_method  # Store scrape_method for web extractor
         self.whisper_model = None
@@ -397,6 +401,7 @@ class Indexer:
                 response = self.session.request("POST", url, headers=post_headers, files=files)
         except Exception as e:
             logger.error(f"Exception {e} while uploading file {filename}")
+            self.last_error = f"upload exception: {e}"
             return False
 
         # Handle the response
@@ -430,8 +435,12 @@ class Indexer:
                             if self.store_docs:
                                 store_file(filename, url_to_filename(uri), self.store_docs, self.store_docs_folder)
                             return True
+                        # Re-upload returned a non-201 — fall through to the
+                        # generic error path below so the status code lands in
+                        # last_error.
                     except Exception as e:
                         logger.error(f"Failed to re-index file {uri}: {e}")
+                        self.last_error = f"re-upload exception: {e}"
                         return False
             else:
                 # File already exists but reindex is disabled - treat as success
@@ -441,6 +450,7 @@ class Indexer:
 
         # Log error for any other status code
         logger.error(f"Failed to upload file {uri}. Status code: {response.status_code}, Message: {response.text}")
+        self.last_error = f"upload returned HTTP {response.status_code}: {response.text[:200]}"
         return False
 
     def index_document(self, document: Dict[str, Any], use_core_indexing: bool = False) -> bool:
@@ -572,6 +582,7 @@ class Indexer:
             bool: True if the upload was successful, False otherwise.
         """
         succeeded = False
+        self.last_skip_reason = None
         if html_processing is None:
             html_processing = {}
         st = time.time()
@@ -662,6 +673,18 @@ class Indexer:
                     remove_code=self.remove_code,
                     html_processing=html_processing,
                 )
+                # If the fetch was bounced to a sign-in / IdP page, treat it
+                # as a crawl failure: do not index the login form's HTML.
+                auth_reason = auth_redirect_reason(url, res.get('url'))
+                if auth_reason:
+                    logger.warning(
+                        f"Skipping {url}: {auth_reason} ({res.get('url')}). "
+                        f"This usually means the page requires authentication; "
+                        f"configure website_crawler.google_auth / saml_auth "
+                        f"(or grant access to the configured account) to crawl it."
+                    )
+                    self.last_skip_reason = auth_reason
+                    return False
                 html = res['html']
                 text = res['text']
                 doc_title = res['title']
@@ -782,7 +805,7 @@ class Indexer:
                             all_metadatas.append(image_metadata)
                     
                     # Index unified content in single document
-                    doc_id = slugify(url)
+                    doc_id = slugify(normalize_url_for_metadata(url))
                     succeeded = self.index_segments(
                         doc_id=doc_id, 
                         texts=all_texts, 
@@ -795,7 +818,7 @@ class Indexer:
                 else:
                     # Legacy mode: Index text and images separately
                     # Index text and tables first
-                    doc_id = slugify(url)
+                    doc_id = slugify(normalize_url_for_metadata(url))
                     succeeded = self.index_segments(
                         doc_id=doc_id, 
                         texts=parts, 
