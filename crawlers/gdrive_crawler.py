@@ -6,7 +6,7 @@ import os
 import re
 import warnings
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import ray
 from omegaconf import OmegaConf, ListConfig
@@ -275,6 +275,28 @@ def get_gdrive_url(file_id: str, mime_type: str = '') -> str:
     return url
 
 
+def _union_perms_by_id(
+    perms: Iterable[Dict[str, Any]], seen: Optional[Set[str]] = None
+) -> List[Dict[str, Any]]:
+    """Dedupe a permission stream by permission id, preserving first-seen order.
+
+    Drive permission objects always carry an `id`; any entry missing one is kept
+    as-is (defensive). Pass a shared `seen` set to union across several streams
+    (e.g. drive-root members, then a file's own grants) without re-counting ids
+    already taken from an earlier stream — the set is mutated in place.
+    """
+    seen = seen if seen is not None else set()
+    out: List[Dict[str, Any]] = []
+    for p in perms:
+        pid = p.get('id')
+        if pid and pid in seen:
+            continue
+        if pid:
+            seen.add(pid)
+        out.append(p)
+    return out
+
+
 def extract_acl_metadata(
     file_obj: Dict[str, Any],
     parent_permissions: Optional[List[Dict[str, Any]]] = None,
@@ -301,15 +323,7 @@ def extract_acl_metadata(
     is_public = False
 
     direct = list(file_obj.get('permissions') or [])
-    combined = list(direct)
-    seen_ids: Set[str] = {p['id'] for p in direct if p.get('id')}
-    for p in (parent_permissions or []):
-        pid = p.get('id')
-        if pid and pid in seen_ids:
-            continue
-        if pid:
-            seen_ids.add(pid)
-        combined.append(p)
+    combined = _union_perms_by_id(direct + list(parent_permissions or []))
 
     for p in combined:
         if p.get('deleted'):
@@ -391,6 +405,11 @@ class UserWorker(object):
         self._abac_resolve_inherited = self.abac.get('resolve_inherited', False)
         self._abac_include_anyone = self.abac.get('include_anyone', True)
         self._abac_fetch_labels = self.abac.get('fetch_labels', False)
+        # Issue the Shared Drive membership listing as a domain admin. Lets a
+        # domain-admin delegated user read drive members without holding a
+        # per-drive fileOrganizer/organizer role (the usual cause of the 403
+        # that downgrades files to acl_source=shared_drive_partial).
+        self._abac_shared_drive_admin_access = self.abac.get('shared_drive_admin_access', False)
 
         # Optional: restrict the crawl to one or more subtrees. Accepts either
         # a single Drive folder URL/id (legacy form) or a list of them, so a
@@ -712,54 +731,52 @@ class UserWorker(object):
                     out.append(f)
         return out
 
-    def _fetch_drive_permissions(self, drive_id: str) -> Tuple[List[Dict[str, Any]], str]:
-        """Return (members, source) for a Shared Drive, with per-worker caching.
+    def _fetch_item_permissions(self, item_id: str) -> Tuple[List[Dict[str, Any]], bool]:
+        """Page through `permissions.list` for any Drive item (file/folder/drive).
 
-        Drive's `files.list` does not propagate drive-level member grants onto
-        a file's `permissions` array — so a Shared Drive file whose access is
-        purely inherited from the drive comes back from list() with
-        `permissions=[]`, which downstream renders as an empty acl_*. To
-        recover the true ACL we fetch `permissions.list(fileId=<driveId>)`
-        once per drive and let the caller merge those grants in.
+        Returns `(permissions, ok)`. `ok` is False when the listing failed
+        (e.g. a 403 because the delegated user can't read the item's ACL);
+        callers downgrade their `acl_source` to a `*_partial` variant.
 
-        Caveat: enumerating a Shared Drive's full member list requires the
-        delegated user to have at least the `fileOrganizer` role on that
-        drive. Lower roles get a 403; we mark the source as
-        `shared_drive_partial` and cache that outcome so we don't hammer
-        Drive once per file. Sub-folder-level overrides within the drive
-        are out of scope here — they would need an ancestor walk like the
-        My Drive path, which is the existing `_folder_acl_cache` flow.
+        This is the only reliable way to read a Shared Drive item's ACL: the
+        File resource's `permissions` field is documented as "not populated for
+        items in shared drives", so `files.list`/`files.get` return
+        `permissions=[]` there. `permissions.list` on a shared-drive item
+        returns the complete effective ACL — direct grants plus those inherited
+        from parent folders and drive membership (surfaced via
+        `permissionDetails.inheritedFrom`), including `type:'group'` grants.
+
+        Enumerating these grants requires the delegated user to have at least
+        `fileOrganizer` on the drive; lower roles get a 403. Set
+        `abac.shared_drive_admin_access` (domain-admin delegated user) to read
+        via `useDomainAdminAccess`.
         """
-        cached = self._drive_perms_cache.get(drive_id)
-        if cached is not None:
-            return cached
-
-        fields = (
-            'nextPageToken,' + _PERM_FIELDS
-        )
+        fields = 'nextPageToken,' + _PERM_FIELDS
         collected: List[Dict[str, Any]] = []
-        source = ACL_SOURCE_SHARED_DRIVE
         page_token: Optional[str] = None
         while True:
             params = {
-                'fileId': drive_id,
+                'fileId': item_id,
                 'supportsAllDrives': True,
                 'fields': fields,
             }
+            if self._abac_shared_drive_admin_access:
+                params['useDomainAdminAccess'] = True
             if page_token:
                 params['pageToken'] = page_token
             try:
                 resp = self.service.permissions().list(**params).execute()
             except HttpError as e:
-                logger.info(f"permissions.list failed for shared drive {drive_id}: {e}")
-                collected = []
-                source = ACL_SOURCE_SHARED_DRIVE_PARTIAL
-                break
+                logger.warning(
+                    f"permissions.list failed for item {item_id}: {e}; "
+                    "delegated user likely lacks fileOrganizer/organizer access — "
+                    "grant a manager role or set abac.shared_drive_admin_access "
+                    "(requires a domain-admin delegated user)."
+                )
+                return [], False
             except Exception as e:
-                logger.info(f"Error listing permissions for shared drive {drive_id}: {e}")
-                collected = []
-                source = ACL_SOURCE_SHARED_DRIVE_PARTIAL
-                break
+                logger.info(f"Error listing permissions for item {item_id}: {e}")
+                return [], False
 
             for p in (resp.get('permissions') or []):
                 collected.append(p)
@@ -767,21 +784,64 @@ class UserWorker(object):
             if not page_token:
                 break
 
-        self._drive_perms_cache[drive_id] = (collected, source)
-        return collected, source
+        return collected, True
+
+    def _fetch_drive_permissions(self, drive_id: str) -> Tuple[List[Dict[str, Any]], str]:
+        """Return (members, source) for a Shared Drive, with per-worker caching.
+
+        Fetches the drive-root membership via `permissions.list(fileId=<driveId>)`
+        (see `_fetch_item_permissions`). A 403 (delegated user lacks
+        fileOrganizer/organizer on the drive) yields an empty list and the
+        `shared_drive_partial` source; the outcome is cached either way so we
+        don't hammer Drive once per file.
+        """
+        cached = self._drive_perms_cache.get(drive_id)
+        if cached is not None:
+            return cached
+
+        members, ok = self._fetch_item_permissions(drive_id)
+        source = ACL_SOURCE_SHARED_DRIVE if ok else ACL_SOURCE_SHARED_DRIVE_PARTIAL
+        result = (members, source)
+        self._drive_perms_cache[drive_id] = result
+        return result
 
     def _resolve_parent_acl(self, file_obj: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
         """Resolve inherited permissions for a file.
 
         For Shared Drive files: fetch the drive's member list (cached per
-        worker per drive). For My Drive files with `resolve_inherited=True`:
+        worker per drive) and union any grants made on the folders between the
+        file and the drive root. For My Drive files with `resolve_inherited=True`:
         walk ancestor folders and union their ACLs.
 
         Returns (union of inherited permissions, source discriminator).
         """
         drive_id = file_obj.get('driveId')
         if drive_id:
-            return self._fetch_drive_permissions(drive_id)
+            members, source = self._fetch_drive_permissions(drive_id)
+            # Drive's File resource does not populate `permissions` for items in
+            # shared drives, so grants made directly on the file or inherited
+            # from intermediate folders never appear in files.list output (the
+            # file comes back with permissions=[]). `permissions.list` on the
+            # file recovers the complete effective ACL — direct grants plus
+            # those inherited from parent folders and drive membership,
+            # including group grants. Union it with the drive-root membership
+            # (deduped by permission id) so nothing is double-counted.
+            #
+            # The per-file `permissions.list` normally already includes the
+            # drive-root grants (they show up as inherited entries), so the
+            # drive-root fetch above is usually redundant. We keep it as a
+            # cheap backup/fallback: it is cached one-call-per-drive, and it
+            # guarantees drive membership is captured even if a file's own
+            # listing ever comes back incomplete.
+            combined = list(members)
+            file_id = file_obj.get('id')
+            if file_id:
+                file_perms, file_ok = self._fetch_item_permissions(file_id)
+                if not file_ok and source == ACL_SOURCE_SHARED_DRIVE:
+                    source = ACL_SOURCE_SHARED_DRIVE_PARTIAL
+                seen_ids = {p.get('id') for p in members if p.get('id')}
+                combined.extend(_union_perms_by_id(file_perms, seen=seen_ids))
+            return combined, source
 
         if not self._abac_resolve_inherited:
             return [], ACL_SOURCE_MY_DRIVE_DIRECT
@@ -790,7 +850,24 @@ class UserWorker(object):
         if not parents:
             return [], ACL_SOURCE_MY_DRIVE_RESOLVED
 
-        collected: Dict[str, Dict[str, Any]] = {}
+        perms, partial = self._walk_ancestor_acls(parents)
+        source = ACL_SOURCE_MY_DRIVE_PARTIAL if partial else ACL_SOURCE_MY_DRIVE_RESOLVED
+        return perms, source
+
+    def _walk_ancestor_acls(
+        self, parents: List[str]
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """BFS up the ancestor-folder chain, unioning each folder's direct ACL.
+
+        Used for My Drive's `resolve_inherited`, where `files.get` does populate
+        a folder's `permissions`. (Shared drives read the full effective ACL
+        straight off the file via `permissions.list`, so they don't walk here.)
+        Folder ACLs are cached per worker in `_folder_acl_cache`, deduped by
+        permission id. Returns (permissions, partial), where `partial` is True
+        if any ancestor folder couldn't be read.
+        """
+        collected: List[Dict[str, Any]] = []
+        perm_seen: Set[str] = set()
         seen: Set[str] = set()
         partial = False
         frontier = list(parents)
@@ -823,17 +900,12 @@ class UserWorker(object):
                     fparents = resp.get('parents', []) or []
                     self._folder_acl_cache[folder_id] = (perms, fparents)
 
-                for p in perms:
-                    pid = p.get('id')
-                    if pid and pid not in collected:
-                        collected[pid] = p
-
+                collected.extend(_union_perms_by_id(perms, seen=perm_seen))
                 next_frontier.extend(fparents)
 
             frontier = next_frontier
 
-        source = ACL_SOURCE_MY_DRIVE_PARTIAL if partial else ACL_SOURCE_MY_DRIVE_RESOLVED
-        return list(collected.values()), source
+        return collected, partial
 
     def _load_label_defs(self) -> Dict[str, Dict[str, Any]]:
         """Fetch and cache Drive Labels definitions keyed by labelId."""
@@ -909,15 +981,21 @@ class UserWorker(object):
                 fdef = (ldef.get('fields') or {}).get(fid, {})
                 choices = fdef.get('choices') or {}
                 values: List[str] = []
+                # text/integer/dateString are arrays in the Drive API (like
+                # selection/user), not scalars — iterate so a value renders
+                # `Title=value`, not `Title=['value']`.
                 if 'selection' in fdata:
                     for cid in fdata.get('selection') or []:
                         values.append(choices.get(cid, cid))
                 elif 'text' in fdata:
-                    values.append(str(fdata.get('text', '')))
+                    for t in fdata.get('text') or []:
+                        values.append(str(t))
                 elif 'integer' in fdata:
-                    values.append(str(fdata.get('integer', '')))
+                    for n in fdata.get('integer') or []:
+                        values.append(str(n))
                 elif 'dateString' in fdata:
-                    values.append(str(fdata.get('dateString', '')))
+                    for d in fdata.get('dateString') or []:
+                        values.append(str(d))
                 elif 'user' in fdata:
                     for u in fdata.get('user') or []:
                         ue = u.get('emailAddress') if isinstance(u, dict) else u
@@ -1106,7 +1184,12 @@ class UserWorker(object):
                     reason = self.df_parser.last_error or "process_dataframe_file returned False"
                     self._record_drop('index_error', file, reason)
             else:
-                ok = self.indexer.index_file(filename=local_file_path, uri=url, metadata=file_metadata)
+                ok = self.indexer.index_file(
+                    filename=local_file_path,
+                    uri=url,
+                    metadata=file_metadata,
+                    id=file_id,
+                )
                 if ok:
                     self._record_indexed(file, file_metadata, parent_permissions=parent_perms)
                 else:
@@ -1117,6 +1200,34 @@ class UserWorker(object):
             self._record_drop('index_error', file, f"exception: {e}")
 
         safe_remove_file(local_file_path)
+
+    def _reconcile_oauth_scopes(self, credentials_file: str, scopes: List[str]) -> List[str]:
+        """Drop the optional Drive Labels scope when the saved OAuth token wasn't
+        granted it, so the token refresh doesn't fail with invalid_scope. A
+        refresh token only carries the scopes consented to when it was minted, and
+        Google rejects a refresh that asks for anything beyond that. Also disables
+        label fetching for this run so we don't trade the crash for a per-file 403.
+        Returns the scopes that are actually safe to request."""
+        if DRIVE_LABELS_SCOPE not in scopes:
+            return scopes
+        try:
+            with open(credentials_file, 'r') as f:
+                granted = json.load(f).get("scopes") or []
+        except (OSError, json.JSONDecodeError):
+            # Couldn't read the grants — leave scopes untouched so
+            # get_oauth_credentials surfaces the real file/JSON error.
+            return scopes
+        if DRIVE_LABELS_SCOPE in granted:
+            return scopes
+        logger.warning(
+            "OAuth token %s was not granted the Drive Labels scope (%s); "
+            "continuing without labels. Re-run "
+            "scripts/gdrive/generate_oauth_token.py --with-labels to enable "
+            "label ingestion.",
+            credentials_file, DRIVE_LABELS_SCOPE,
+        )
+        self._abac_fetch_labels = False
+        return [s for s in scopes if s != DRIVE_LABELS_SCOPE]
 
     def process(self, user: str) -> None:
         logger.info(f"Processing files for user: {user}")
@@ -1140,6 +1251,7 @@ class UserWorker(object):
         if auth_type == "oauth":
             # Use OAuth authentication with token from credentials.json
             logger.info("Using OAuth authentication")
+            scopes = self._reconcile_oauth_scopes(credentials_file, scopes)
             self.creds = get_oauth_credentials(credentials_file, scopes=scopes)
         else:
             # Use service account with domain-wide delegation (default)

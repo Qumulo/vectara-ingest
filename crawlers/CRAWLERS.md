@@ -448,8 +448,12 @@ crawling:
 
 confluencedatacenter:
   base_url: "http://confluence.internal:8090"
+  # Auth — use ONE of:
+  #  (a) basic auth:
   confluence_datacenter_username: "<username>"
   confluence_datacenter_password: "<password>"
+  #  (b) Personal Access Token (takes precedence if set):
+  # confluence_datacenter_pat: "<token>"
   confluence_cql: 'space = "TEST" and type IN (page, blogpost)'
 
   confluence_include_attachments: true
@@ -463,10 +467,13 @@ confluencedatacenter:
     mode: "element"
 ```
 
-This crawler is the on-prem / self-hosted counterpart of the Confluence (Cloud) crawler. It targets a Confluence Data Center instance via its REST API and HTTP Basic Auth. Note: the YAML key is `confluencedatacenter` (not `confluencedatacenter_crawler`), and `crawling.crawler_type: confluencedatacenter`.
+This crawler is the on-prem / self-hosted counterpart of the Confluence (Cloud) crawler. It targets a Confluence Data Center instance via its REST API, using either HTTP Basic Auth or a Personal Access Token (PAT). Note: the YAML key is `confluencedatacenter` (not `confluencedatacenter_crawler`), and `crawling.crawler_type: confluencedatacenter`.
 
 - `base_url`: base URL of your Confluence Data Center instance (e.g., `http://confluence.internal:8090`).
-- `confluence_datacenter_username` / `confluence_datacenter_password`: HTTP Basic Auth credentials. Place in `secrets.toml` (`CONFLUENCEDATACENTER_USERNAME`, `CONFLUENCEDATACENTER_PASSWORD`) so they are not committed.
+- Authentication — provide **one** of the following:
+  - `confluence_datacenter_username` / `confluence_datacenter_password`: HTTP Basic Auth credentials.
+  - `confluence_datacenter_pat`: a [Personal Access Token](https://confluence.atlassian.com/enterprise/using-personal-access-tokens-1026032365.html), sent as `Authorization: Bearer <token>`. Use this for SSO/SAML-enforced instances where basic auth is disabled. If both a PAT and basic-auth credentials are set, the PAT takes precedence.
+  - Place credentials in `secrets.toml` so they are not committed. The keys must be `CONFLUENCE_DATACENTER_USERNAME`, `CONFLUENCE_DATACENTER_PASSWORD`, and/or `CONFLUENCE_DATACENTER_PAT` (note the underscore between `CONFLUENCE` and `DATACENTER` — without it the value is not mapped to this crawler).
 - `confluence_cql`: a [CQL](https://developer.atlassian.com/cloud/confluence/advanced-searching-using-cql/) query selecting the content to crawl.
 - `confluence_include_attachments`: when `true`, also indexes attachments. Default: `false`.
 - `include_image_attachments`: process image attachments (PNG/JPG/etc.). Default: `false`. Image-to-text descriptions require `doc_processing.summarize_images` at the top level.
@@ -476,7 +483,7 @@ This crawler is the on-prem / self-hosted counterpart of the Confluence (Cloud) 
 - `dataframe_processing`: optional dataframe-parser config applied to CSV/XLSX attachments. Same shape as in the SharePoint and CSV crawlers (`mode`, `doc_id_columns`, `text_columns`, `metadata_columns`, etc.).
 - `ssl_verify`: see standard SSL handling.
 
-Each indexed document gets metadata for `type` (page/blogpost/attachment), `id`, `last_updates`, `version`, `updated_by`, `space` (id/key/name), `url`, plus `filename` and `attachment_type` for attachments.
+Each indexed document gets metadata for `type` (page/blogpost/attachment), `id`, `title`, `source` (`"Confluence"` by default, overridable via the `source` config key), `last_updated`, `version`, `updated_by` (whichever of `username`/`userKey`/`displayName`/`accountId` the instance returns), `space` (id/key/name), and `url`. Attachments additionally get `filename` and `attachment_type`, and their `source` is set to `"confluence_attachment"`.
 
 ### Twitter crawler
 
@@ -730,9 +737,10 @@ When `abac.enabled: true`, every indexed document is tagged with filterable ACL 
 
 **ABAC sub-options:**
 - `abac.enabled`: emit `acl_*` metadata on every indexed document. Default: `false`.
-- `abac.resolve_inherited`: My Drive files don't receive inherited permissions via the API. When `true`, the crawler walks each file's parent folders and unions their ACLs (folder lookups are cached per worker; adds API round-trips). Shared Drive files are handled separately and unconditionally: Drive's `files.list` does **not** propagate Shared Drive member grants onto a file's `permissions` array, so the crawler issues one `permissions.list(fileId=<driveId>)` per drive (cached per worker) and merges those members into each file's ACL. This call requires the delegated user to have at least the `fileOrganizer` role on the drive; otherwise Drive returns 403 and the crawler tags the affected files `acl_source: shared_drive_partial` so operators can spot the gap. Default: `false`.
+- `abac.resolve_inherited`: My Drive files don't receive inherited permissions via the API. When `true`, the crawler walks each file's parent folders and unions their ACLs (folder lookups are cached per worker; adds API round-trips). Shared Drive files are handled separately and unconditionally: Drive's File resource does **not** populate `permissions` for shared-drive items, so the crawler reads each file's ACL with `permissions.list(fileId=<fileId>)` — one call per shared-drive file, not cached. That returns the complete effective ACL: direct file grants plus those inherited from parent folders and drive membership, including group grants. The drive-root membership is also fetched once per drive (`permissions.list(fileId=<driveId>)`, cached per worker) and unioned in as a backup. ACL resolution is therefore O(shared-drive files), not O(drives) — size API quota accordingly. These calls require the delegated user to have at least the `fileOrganizer` role on the drive; a 403 on **either** the per-file or the drive-root listing still indexes the file but tags it `acl_source: shared_drive_partial` so operators can spot the gap. Default: `false`.
 - `abac.include_anyone`: treat `type=anyone` grants as public (sets `acl_is_public=true`). Default: `true`.
 - `abac.fetch_labels`: fetch Drive Labels per file and store them in `acl_labels`. Adds one round-trip per file plus one definitions fetch per worker, and requires the `drive.labels.readonly` OAuth scope (added automatically when this flag is on). Default: `false`.
+- `abac.shared_drive_admin_access`: issue the Shared Drive `permissions.list` calls — both the per-file listings and the drive-root membership listing — with `useDomainAdminAccess=true`. Use this when the delegated user is a Workspace domain admin but does not hold a `fileOrganizer`/organizer role on the shared drives being crawled; without it those listings return 403 and the affected files are tagged `acl_source: shared_drive_partial` with empty `acl_groups`. Default: `false`.
 
 **Important Notes:**
 - OAuth mode only supports a single user account; for multi-user crawling, use `service_account` mode.
@@ -751,6 +759,12 @@ Each file passes through several gates between Drive and the indexer. A drop at 
 5. **Extension allowlist (post-download)** — file is rejected unless it's a dataframe (`.csv`, `.tsv`, `.psv`, `.pipe`, `.xls`, `.xlsx` — see `supported_by_dataframe_parser` in `core/dataframe_parser.py`) or extension is in `{.doc, .docx, .ppt, .pptx, .pdf, .odt, .txt, .html, .md, .rtf, .epub, .lxml}` (plus image extensions when `summarize_images` is on).
 6. **Download/export** — files whose Drive download or Workspace export fails (e.g. `exportSizeLimitExceeded` with no PDF fallback) are counted as `download_failed`.
 7. **Indexing** — `indexer.index_file` returning `False` or raising is counted as `index_error`; success is counted as `indexed`.
+
+**Document identity (`doc_id`):**
+
+The Vectara `doc_id` for every gdrive-crawled file is the Google Drive `file.id` — the immutable identifier Drive assigns when the file is created. This holds for both the standard indexing path and the dataframe path (CSV/XLSX/Sheets). Renaming, moving, editing, sharing, or producing new revisions all preserve `file.id`, so re-crawls upsert the same Vectara document. A file only gets a new `doc_id` if it is deleted and re-uploaded, or copied via *File → Make a copy* (which Drive itself treats as a new file).
+
+> **Breaking change (upgrading from a release prior to this one):** earlier versions did not pass an explicit `id` for the non-dataframe path, so the indexer fell back to `slugify(uri)` (e.g. `https-drive-google-com-file-d-<id>-view`). After upgrading, those files will be re-indexed under the bare `file.id` and the old slug-keyed documents will remain in the corpus as orphans until they age out via your incremental-crawl deletion logic. If you need to clean them up immediately, list corpus documents whose `metadata.source == 'gdrive'` and whose `doc_id` starts with `https-` and delete them. The dataframe path is unaffected — it has always used `file.id` directly.
 
 
 ### Folder crawler
