@@ -7,6 +7,7 @@ import os
 from io import StringIO, BytesIO
 import gc
 import base64
+import shutil
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
@@ -26,6 +27,8 @@ from unstructured.partition.pdf import partition_pdf
 from unstructured.partition.html import partition_html
 from unstructured.partition.pptx import partition_pptx
 from unstructured.partition.docx import partition_docx
+from unstructured.chunking.title import chunk_by_title
+from unstructured.chunking.basic import chunk_elements
 
 from omegaconf import OmegaConf
 
@@ -430,13 +433,11 @@ class DocupandaDocumentParser(DocumentParser):
         all_elements = []  # For building unified content stream
         tables = []
         image_bytes = []  # Store image binary data
-        img_folder = '/images'
         base_url = 'https://app.docupanda.io/document'
-        os.makedirs(img_folder, exist_ok=True)
 
         # Phase 1: post document
         payload = {"document": {"file": {
-            "contents": base64.b64encode(open(filename, 'rb').read()).decode(),
+            "contents": base64.b64encode(pathlib.Path(filename).read_bytes()).decode(),
                 "filename": filename
             }}}
         headers = {
@@ -444,9 +445,9 @@ class DocupandaDocumentParser(DocumentParser):
             "content-type": "application/json",
             "X-API-Key": self._api_key
         }
-        response = requests.post(base_url, json=payload, headers=headers)
+        response = requests.post(base_url, json=payload, headers=headers, timeout=60)
         if response.status_code != 200:
-            logger.error(f"Docupanda: failed to post document, response code {response.status_code}, msg={response.json()}")
+            logger.error(f"Docupanda: failed to post document, response code {response.status_code}, msg={response.text}")
             return ParsedDocument(title='', content_stream=[], tables=[], image_bytes=[])
 
         # Phase 2: get document; poll until ready, but no longer than timeout
@@ -455,8 +456,10 @@ class DocupandaDocumentParser(DocumentParser):
         start_time = time.time()
         completed = False
         while time.time() - start_time < timeout:
-            response = requests.get(f"{base_url}/{document_id}", headers=headers)
-            if response.json()['status'] == 'completed':
+            response = requests.get(f"{base_url}/{document_id}", headers=headers, timeout=60)
+            if response.status_code != 200:
+                logger.warning(f"Docupanda: polling for document {document_id} returned status {response.status_code}, retrying")
+            elif response.json().get('status') == 'completed':
                 completed = True
                 break
             time.sleep(1)
@@ -640,8 +643,8 @@ class LlamaParseDocumentParser(DocumentParser):
         doc_title = extract_document_title(filename)
         
         image_bytes = []  # Store image binary data
-        img_folder = '/images'
-        os.makedirs(img_folder, exist_ok=True)
+        # Images are downloaded here for summarization and removed afterwards.
+        img_folder = tempfile.mkdtemp(prefix="llamaparse_images_")
 
         nest_asyncio.apply()
         json_objs = self.parser.get_json_result(filename)
@@ -726,7 +729,9 @@ class LlamaParseDocumentParser(DocumentParser):
                         }
                         page_elements[page_num].append(('image', summary, metadata))
                     task['image_bytes'] = None  # Release memory
-        
+
+        shutil.rmtree(img_folder, ignore_errors=True)
+
         # Now build the final positioned elements using standard formula
         for page_num in sorted(page_elements.keys()):
             base_position = page_num * 1000
@@ -1633,17 +1638,21 @@ class UnstructuredDocumentParser(DocumentParser):
             
             # Pass 1: Get raw elements without chunking to establish positions
             raw_elements = self._get_elements(filename, override_chunking=True)
-            
-            # Create position map for raw elements
-            raw_positions = {}
-            for idx, element in enumerate(raw_elements):
-                page_num = getattr(element.metadata, 'page_number', 1) or 1
-                # Position formula: page_num * 1000 + element_index
-                position = page_num * 1000 + idx
-                raw_positions[id(element)] = (position, page_num, idx)
-            
-            # Pass 2: Get chunked text elements
-            chunked_elements = self._get_elements(filename, override_chunking=False)
+
+            # Pass 2: Derive chunked text from the raw elements in-process.
+            # partition(..., chunking_strategy=...) would re-run the entire (expensive)
+            # hi_res layout pass before chunking. unstructured's chunkers operate on
+            # already-partitioned elements, so we reuse raw_elements here instead of
+            # partitioning the document a second time (pure efficiency; identical output).
+            # The chunkers iterate raw_elements once and never mutate it, so it stays
+            # intact for the raw table/image extraction below (no defensive copy needed).
+            if self.chunking_strategy == "by_title":
+                chunked_elements = chunk_by_title(raw_elements, max_characters=self.chunk_size)
+            elif self.chunking_strategy == "basic":
+                chunked_elements = chunk_elements(raw_elements, max_characters=self.chunk_size)
+            else:
+                # Unknown strategy: fall back to unstructured's built-in chunking pass
+                chunked_elements = self._get_elements(filename, override_chunking=False)
             
             # Log what we found
             chunked_types = {}
@@ -1664,8 +1673,7 @@ class UnstructuredDocumentParser(DocumentParser):
             # Single pass when not chunking
             elements = self._get_elements(filename)
             raw_tables_images = elements  # Same elements for everything
-            raw_positions = None  # Not needed when not chunking
-            
+
             # Log element types
             element_types = {}
             for e in elements:
