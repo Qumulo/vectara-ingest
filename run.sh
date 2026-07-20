@@ -3,6 +3,8 @@
 # args[1] = config file
 # args[2] = secrets profile
 # example: sh run.sh <config>news-bbc.yaml dev
+# Optional: SECRETS_FILE env var points at an alternate secrets.toml
+# (default: ./secrets.toml). e.g. SECRETS_FILE=/path/to/secrets.toml sh run.sh ...
 
 # Error handling with consistent exit codes
 readonly ERR_MISSING_ARGS=1
@@ -32,8 +34,10 @@ if [[ ! -f "$1" ]]; then
   exit "$ERR_INVALID_CONFIG"
 fi
 
-if [[ ! -f secrets.toml ]]; then
-  echo "Error: secrets.toml file does not exist, please create one following the README instructions" >&2
+SECRETS_FILE="${SECRETS_FILE:-secrets.toml}"
+[[ "$SECRETS_FILE" = /* ]] || SECRETS_FILE="$(pwd)/$SECRETS_FILE"
+if [[ ! -f "$SECRETS_FILE" ]]; then
+  echo "Error: secrets file '$SECRETS_FILE' does not exist, please create one following the README instructions" >&2
   exit "$ERR_MISSING_SECRETS"
 fi
 
@@ -152,6 +156,14 @@ if [[ -n "${no_proxy}" ]]; then
   BUILD_ARGS="$BUILD_ARGS --build-arg NO_PROXY=\"${no_proxy}\""
 fi
 
+# Opt-in (env var, default off): bake docling + EasyOCR + NLTK data into the image for
+# air-gapped / on-prem use. When DOWNLOAD_DOCLING_MODELS=true, the Dockerfile also sets
+# HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE so no HuggingFace fetch is attempted at runtime.
+#   DOWNLOAD_DOCLING_MODELS=true bash run.sh <config> <profile>
+if [[ "${DOWNLOAD_DOCLING_MODELS}" == "true" ]]; then
+  BUILD_ARGS="$BUILD_ARGS --build-arg DOWNLOAD_DOCLING_MODELS=true"
+fi
+
 
 # Read config values for extra features
 sum_tables=$(read_yaml_nested "data.get('doc_processing', {}).get('summarize_tables', 'false').lower()")
@@ -172,8 +184,18 @@ else
   echo "Building base image"
 fi
 
+# Pre-baked model images (DOWNLOAD_DOCLING_MODELS) are tagged 'latest.onprem' so they
+# never overwrite the regular ':latest' image. This matches the '.onprem' suffix the CI
+# workflow publishes (.github/workflows/docker-image.yml).
+if [[ "${DOWNLOAD_DOCLING_MODELS}" == "true" ]]; then
+  image_tag="latest.onprem"
+  echo "Baking models into image: $tag:$image_tag (docling+easyocr+nltk)"
+else
+  image_tag="latest"
+fi
+
 # Build Docker image
-docker_build_cmd="docker $BUILD_CMD $BUILD_ARGS --build-arg INSTALL_EXTRA=\"$(needs_extra_features && echo true || echo false)\" --platform linux/$ARCH . --tag=\"$tag:latest\""
+docker_build_cmd="docker $BUILD_CMD $BUILD_ARGS --build-arg INSTALL_EXTRA=\"$(needs_extra_features && echo true || echo false)\" --platform linux/$ARCH . --tag=\"$tag:$image_tag\""
 echo "$docker_build_cmd"
 eval "$docker_build_cmd"
 
@@ -218,7 +240,7 @@ docker container inspect "${CONTAINER_NAME}" &>/dev/null && docker rm -f "${CONT
 DOCKER_RUN_ARGS=()
 DOCKER_RUN_ARGS+=(-v "${ABSOLUTE_CONFIG_PATH}:/home/vectara/env/${CONFIG_NAME}:ro")
 
-DOCKER_RUN_ARGS+=(-v "$(pwd)/secrets.toml:/home/vectara/env/secrets.toml:ro")
+DOCKER_RUN_ARGS+=(-v "${SECRETS_FILE}:/home/vectara/env/secrets.toml:ro")
 
 if [[ -f ca.pem ]]; then
   DOCKER_RUN_ARGS+=(-v "$(pwd)/ca.pem:/home/vectara/env/ca.pem:ro")
@@ -389,12 +411,20 @@ DOCKER_RUN_ARGS+=(-v "$HOME/tmp/mount:/home/vectara/${output_dir}:rw")
 
 DOCKER_RUN_ARGS+=(-e "CONFIG=/home/vectara/env/$config_file_name")
 
+# Air-gap guard: the docling-baked image already sets HF_HUB_OFFLINE, so no HuggingFace
+# fetch should happen. Point HF_ENDPOINT at a dead host so any regression that still tries
+# to reach the Hub fails loudly instead of silently succeeding. Only HF traffic is affected
+# (Vectara's API host is untouched).
+if [[ "${DOWNLOAD_DOCLING_MODELS}" == "true" ]]; then
+  DOCKER_RUN_ARGS+=(-e "HF_ENDPOINT=http://127.0.0.1:1")
+fi
+
 # Increase shared memory size for Ray workers to prevent OOM
 # Set to 15GB (adjust based on available system RAM)
 DOCKER_RUN_ARGS+=(--shm-size=15gb)
 
-echo Running docker: docker run -d "${DOCKER_RUN_ARGS[@]}" -e PROFILE=$2 --name "${CONTAINER_NAME}" $tag
-docker run -d "${DOCKER_RUN_ARGS[@]}" -e PROFILE=$2 --name "${CONTAINER_NAME}" $tag
+echo Running docker: docker run -d "${DOCKER_RUN_ARGS[@]}" -e PROFILE=$2 --name "${CONTAINER_NAME}" $tag:$image_tag
+docker run -d "${DOCKER_RUN_ARGS[@]}" -e PROFILE=$2 --name "${CONTAINER_NAME}" $tag:$image_tag
 
 if [ $? -eq 0 ]; then
   echo "Success! Ingest job is running."
