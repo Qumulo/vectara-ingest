@@ -37,11 +37,11 @@ def make_crawler():
 
 class TestPmcPaperIndexing(unittest.TestCase):
 
-    def test_indexes_article_html_on_current_pmc_domain(self):
+    def test_article_url_uses_current_pmc_domain(self):
         # Regression: www.ncbi.nlm.nih.gov/pmc/... now 301s to
-        # pmc.ncbi.nlm.nih.gov, and /pdf/ serves a JS interstitial with no
-        # content for non-browser clients, so the crawler must index the
-        # article HTML page on the current domain.
+        # pmc.ncbi.nlm.nih.gov; the crawler must use the current domain.
+        # The path is the article HTML page, not /pdf/ — PMC serves a JS
+        # interstitial there that yields no content (see pmc_crawler.py).
         crawler = make_crawler()
         with patch("crawlers.pmc_crawler.get_top_n_papers",
                    return_value=["123"]):
