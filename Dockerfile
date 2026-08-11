@@ -32,8 +32,18 @@ WORKDIR ${HOME}
 COPY requirements.txt requirements-extra.txt $HOME/
 
 RUN pip install --no-cache-dir uv==0.6.14
-RUN uv pip install --no-cache-dir torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cpu \
-    && uv pip install --no-cache-dir -r requirements.txt
+# Take the torch pins from requirements.txt rather than repeating them here:
+# hardcoded copies go stale on a lock bump, and the newer torch then comes from
+# PyPI as the CUDA build. The final check fails the build if that happens --
+# CUDA wheels are ~2 GB and nothing loads them (CUDA_VISIBLE_DEVICES="").
+RUN TORCH_PINS="$(grep -E '^(torch|torchvision)==' requirements.txt)" \
+    && test -n "$TORCH_PINS" \
+    && uv pip install --no-cache-dir $TORCH_PINS --index-url https://download.pytorch.org/whl/cpu \
+    && uv pip install --no-cache-dir -r requirements.txt \
+    && if pip list --format=freeze | grep '^nvidia-'; then \
+           echo "ERROR: CUDA wheels installed above -- CPU torch was overridden" >&2; \
+           exit 1; \
+       fi
 
 ARG INSTALL_EXTRA=false
 RUN if [ "$INSTALL_EXTRA" = "true" ]; then \
@@ -41,6 +51,17 @@ RUN if [ "$INSTALL_EXTRA" = "true" ]; then \
         python3 -m spacy download en_core_web_lg; \
     fi
     
+# ray vendors a private aiohttp for its runtime-env agent under
+# ray/_private/runtime_env/agent/thirdparty_files; scanners flag that copy
+# separately from the site-packages one. Same grep-from-lock pattern as the
+# torch pins above so it can never go stale on a lock bump.
+RUN AGENT_DIR=/usr/local/lib/python3.12/site-packages/ray/_private/runtime_env/agent/thirdparty_files \
+    && AIOHTTP_PIN="$(grep -E '^aiohttp==' requirements.txt)" \
+    && test -n "$AIOHTTP_PIN" \
+    && pip install --no-cache-dir --no-deps --upgrade --target "$AGENT_DIR" "$AIOHTTP_PIN" \
+    && find "$AGENT_DIR" -maxdepth 1 -name 'aiohttp-*.dist-info' \
+         ! -name "aiohttp-${AIOHTTP_PIN#aiohttp==}.dist-info" -exec rm -rf '{}' +
+
 # Clean up unnecessary files
 RUN find /usr/local -type d \( -name test -o -name tests \) -exec rm -rf '{}' + \
     && find /usr/local -type f \( -name '*.pyc' -o -name '*.pyo' \) -exec rm -rf '{}' + \
