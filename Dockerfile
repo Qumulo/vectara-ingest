@@ -40,7 +40,7 @@ ENV UV_CONCURRENT_DOWNLOADS=4
 RUN TORCH_PINS="$(grep -E '^(torch|torchvision)==' requirements.txt)" \
     && test -n "$TORCH_PINS" \
     && uv pip install --no-cache-dir $TORCH_PINS --index-url https://download.pytorch.org/whl/cpu \
-    && uv pip install --no-cache-dir -r requirements.txt \
+    && UV_CONCURRENT_DOWNLOADS=4 uv pip install --no-cache-dir -r requirements.txt \
     && if pip list --format=freeze | grep '^nvidia-'; then \
            echo "ERROR: CUDA wheels installed above -- CPU torch was overridden" >&2; \
            exit 1; \
