@@ -36,6 +36,7 @@ RUN pip install --no-cache-dir uv==0.6.14
 # hardcoded copies go stale on a lock bump, and the newer torch then comes from
 # PyPI as the CUDA build. The final check fails the build if that happens --
 # CUDA wheels are ~2 GB and nothing loads them (CUDA_VISIBLE_DEVICES="").
+ENV UV_CONCURRENT_DOWNLOADS=4
 RUN TORCH_PINS="$(grep -E '^(torch|torchvision)==' requirements.txt)" \
     && test -n "$TORCH_PINS" \
     && uv pip install --no-cache-dir $TORCH_PINS --index-url https://download.pytorch.org/whl/cpu \
