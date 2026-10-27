@@ -1,10 +1,14 @@
-# v.5.1-1237321225
+# v.5.3-1223127226
 
 vectara:
   corpus_key: Qumulo_Documentation_Portal_2
   customer_id: 4077139778
   reindex: true
   remove_boilerplate: true
+  # Gemini's suggestions
+  requests_per_second: 5
+  max_retries: 5
+  timeout: 90
 
 crawling:
   crawler_type: website
@@ -14,13 +18,13 @@ website_crawler:
   pos_regex: [".*docs.qumulo.*"]
   neg_regex: ['https:\/\/docs\.qumulo\.com\/[a-zA-Z0-9\-]+\/[a-zA-Z0-9\-]+\/index\.html','https:\/\/docs\.qumulo\.com\/[a-zA-Z0-9\-]+\/index\.html']
   pages_source: sitemap
-  extraction: playwright
-  delay: 1
+  extraction: beautifulsoup
+  delay: 0.2
   max_depth: 2
  #crawl_report: true
  #timeout: 30
  #post_load_timeout: 30
-  ray_workers: 40
+  ray_workers: 8 # old value: 40
   remove_old_content: true
   html_processing:
     ids_to_remove: [tg-sb-sidebar,toc,cookie-banner]

@@ -352,6 +352,18 @@ class Indexer:
             f"{self.api_url}/v2/corpora/{self.corpus_key}/documents/{encoded_doc_id}",
             headers=post_headers)
 
+        # --- HACK START: Visible Rate Limit Alert ---
+        if response.status_code == 429:
+            import sys
+            sys.stderr.write(
+                "\n" + "!"*70 + "\n"
+                f"\033[91m\033[1m⚠️  [VECTARA RATE LIMIT EXCEEDED] HTTP 429 | Document Existence Check ⚠️\n"
+                f"Doc ID: {doc_id} | Backing off...\033[0m\n"
+                + "!"*70 + "\n\n"
+            )
+            sys.stderr.flush()
+        # --- HACK END ---
+
         exists = response.status_code == 200
         
         # LRU eviction: remove least recently used item when cache is full
@@ -543,6 +555,18 @@ class Indexer:
             self.last_error = f"upload exception: {e}"
             return False
 
+        # --- HACK START: Visible Rate Limit Alert ---
+        if response.status_code == 429:
+            import sys
+            sys.stderr.write(
+                "\n" + "!"*70 + "\n"
+                f"\033[91m\033[1m⚠️  [VECTARA RATE LIMIT EXCEEDED] HTTP 429 | File Upload API ⚠️\n"
+                f"File: {upload_filename} | Backing off...\033[0m\n"
+                + "!"*70 + "\n\n"
+            )
+            sys.stderr.flush()
+        # --- HACK END ---
+
         # Handle the response
         if response.status_code == 201:
             if self.verbose:
@@ -574,6 +598,13 @@ class Indexer:
                             files, _, content_type = create_upload_files_dict(filename, metadata, self.parse_tables, self.cfg)
                             files['file'] = (upload_filename, file_handle, content_type)
                             response = self.session.request("POST", url, headers=post_headers, files=files)
+
+                        # --- COPIED HACK HERE TOO ---
+                        if response.status_code == 429:
+                            import sys
+                            sys.stderr.write("\n" + "!" * 70 + "\n\033[91m\033[1m⚠️  [VECTARA RATE LIMIT EXCEEDED] HTTP 429 | File Retry API ⚠️\n" + "!" * 70 + "\n\n")
+                            sys.stderr.flush()
+                        # ----------------------------
 
                         if response.status_code == 201:
                             if self.verbose:
@@ -688,6 +719,18 @@ class Indexer:
         except Exception as e:
             logger.info(f"Exception {e} while indexing document {document['id']}")
             return False
+
+        # --- HACK START: Visible Rate Limit Alert ---
+        if response.status_code == 429:
+            import sys
+            sys.stderr.write(
+                "\n" + "!"*70 + "\n"
+                f"\033[91m\033[1m⚠️  [VECTARA RATE LIMIT EXCEEDED] HTTP 429 | Document Index API ⚠️\n"
+                f"Doc ID: {document['id']} | Backing off...\033[0m\n"
+                + "!"*70 + "\n\n"
+            )
+            sys.stderr.flush()
+        # --- HACK END ---
 
         self._last_response_status = response.status_code
 
