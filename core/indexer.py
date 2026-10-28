@@ -48,7 +48,7 @@ from core.indexer_utils import (
 from core.incremental import (
     compute_fingerprint, config_signature, content_hash_from_text, source_tag_for,
 )
-from core.web_extractor_base import create_web_extractor
+from core.web_extractor_base import create_web_extractor, parse_static_html
 from core.file_processor import FileProcessor
 from core.document_builder import MAX_SECTION_CHARS, MAX_PART_SIZE
 
@@ -779,7 +779,8 @@ class Indexer:
 
 
     def index_url(self, url: str, metadata: Dict[str, Any], html_processing: dict = None,
-                  metadata_extractor: callable = None, prior_fingerprint: Optional[str] = None) -> bool:
+                  metadata_extractor: callable = None, prior_fingerprint: Optional[str] = None,
+                  html: Optional[str] = None) -> bool:
         """
         Index a url by rendering it, extracting content and metadata, then uploading to the Vectara corpus.
 
@@ -790,6 +791,8 @@ class Indexer:
             metadata_extractor (callable): Optional function to extract additional metadata from HTML.
                 Function signature: fn(html: str) -> Dict[str, Any]
                 The extractor should return only metadata fields to be indexed.
+            html (str): Optional pre-fetched, server-rendered HTML for `url` (e.g. read from a
+                local mirror). When given, no network fetch of `url` is made.
 
         Returns:
             bool: True if the upload was successful, False otherwise.
@@ -802,7 +805,7 @@ class Indexer:
         url = url.split("#")[0]  # remove fragment, if exists
 
         # if file is going to download, then handle it as local file
-        if self.url_triggers_download(url):
+        if html is None and self.url_triggers_download(url):
             os.makedirs("/tmp", exist_ok=True)
             url_file_path = get_file_path_from_url(url)
             if not url_file_path:
@@ -824,7 +827,7 @@ class Indexer:
                 return False
 
         # If MD or IPYNB file, then we don't need playwright - can just download content directly and convert to text
-        if url.lower().endswith(".md") or url.lower().endswith(".ipynb"):
+        if html is None and (url.lower().endswith(".md") or url.lower().endswith(".ipynb")):
             response = self.session.get(url, timeout=self.timeout)
             response.raise_for_status()
             dl_content = response.content.decode('utf-8')
@@ -841,7 +844,7 @@ class Indexer:
         else:
             try:
                 # Check if URL triggers download or serves PDF content
-                result = self.check_download_or_pdf(url)
+                result = {"type": "html"} if html is not None else self.check_download_or_pdf(url)
                 
                 if result["type"] == "download":
                     # Handle explicit download
@@ -879,13 +882,19 @@ class Indexer:
                     return res
 
                 # If not download or PDF, fetch the page content
-                res = self.fetch_page_contents(
-                    url=url,
-                    extract_tables=self.parse_tables,
-                    extract_images=False,
-                    remove_code=self.remove_code,
-                    html_processing=html_processing,
-                )
+                if html is not None:
+                    res = parse_static_html(html, url)
+                    if res is None:
+                        logger.warning(f"Skipping {url}: provided HTML is too sparse to index")
+                        return False
+                else:
+                    res = self.fetch_page_contents(
+                        url=url,
+                        extract_tables=self.parse_tables,
+                        extract_images=False,
+                        remove_code=self.remove_code,
+                        html_processing=html_processing,
+                    )
                 # If the fetch was bounced to a sign-in / IdP page, treat it
                 # as a crawl failure: do not index the login form's HTML.
                 auth_reason = auth_redirect_reason(url, res.get('url'))
