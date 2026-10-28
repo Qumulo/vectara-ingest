@@ -1,4 +1,4 @@
-# v.5.3-1223127226
+# v.5.7-7371027226
 
 vectara:
   corpus_key: Qumulo_Documentation_Portal_2
@@ -24,7 +24,7 @@ website_crawler:
  #crawl_report: true
  #timeout: 30
  #post_load_timeout: 30
-  ray_workers: 16 # old value: 40
+  ray_workers: 16
   remove_old_content: true
   html_processing:
     ids_to_remove: [tg-sb-sidebar,toc,cookie-banner]
