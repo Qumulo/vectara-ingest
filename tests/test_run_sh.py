@@ -113,6 +113,32 @@ class RunShTestCase(unittest.TestCase):
         self.assertEqual(res.returncode, 10, res.stdout + res.stderr)
         self.assertNotIn("Running docker:", res.stdout)
 
+    @staticmethod
+    def website_config(extra_crawler=""):
+        return ("vectara:\n"
+                "  corpus_key: test-corpus\n"
+                "crawling:\n"
+                "  crawler_type: website\n"
+                "website_crawler:\n"
+                "  urls: [https://docs.example.com]\n" + extra_crawler)
+
+    def test_website_local_mirror_is_mounted_read_only(self):
+        res = self.run_script(self.website_config(
+            "  local_mirror:\n    url_prefix: https://docs.example.com\n    path: __TMP__\n"))
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertRegex(res.stdout, r"-v \S+:/home/vectara/data:ro")
+
+    def test_website_without_local_mirror_mounts_no_data(self):
+        res = self.run_script(self.website_config())
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertNotIn("/home/vectara/data", res.stdout)
+
+    def test_website_missing_local_mirror_aborts(self):
+        res = self.run_script(self.website_config(
+            "  local_mirror:\n    url_prefix: https://docs.example.com\n    path: /nonexistent/site\n"))
+        self.assertNotEqual(res.returncode, 0)
+        self.assertNotIn("Running docker:", res.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,41 @@
+# v.5.7-7371027226
+
+vectara:
+  corpus_key: Qumulo_Documentation_Portal_2
+  customer_id: 4077139778
+  reindex: true
+  remove_boilerplate: true
+  # Gemini's suggestions
+  requests_per_second: 5
+  max_retries: 5
+  timeout: 90
+
+crawling:
+  crawler_type: website
+
+website_crawler:
+  urls: [https://docs.qumulo.com]
+  # Read sitemap + pages from the published gh-pages branch instead of the live site:
+  #   git clone --depth 1 -b gh-pages git@github.com:Qumulo/docs.git /path/to/docs-gh-pages
+  # URLs and doc ids stay https://docs.qumulo.com/..., so this updates the same corpus docs.
+  local_mirror:
+    url_prefix: https://docs.qumulo.com
+    path: /path/to/docs-gh-pages
+  pos_regex: [".*docs.qumulo.*"]
+  neg_regex: ['https:\/\/docs\.qumulo\.com\/[a-zA-Z0-9\-]+\/[a-zA-Z0-9\-]+\/index\.html','https:\/\/docs\.qumulo\.com\/[a-zA-Z0-9\-]+\/index\.html']
+  pages_source: sitemap
+  extraction: beautifulsoup
+  delay: 0.2
+  max_depth: 2
+ #crawl_report: true
+ #timeout: 30
+ #post_load_timeout: 30
+  ray_workers: 32
+  remove_old_content: true
+  html_processing:
+    ids_to_remove: [tg-sb-sidebar,toc,cookie-banner]
+    classes_to_remove: [header-container,below-header,breadcrumb-line,footer]
+   #tags_to_remove: []
+
+doc_processing:
+  summarize_tables: false
