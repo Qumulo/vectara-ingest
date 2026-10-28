@@ -1,10 +1,13 @@
-# v.4.3-32417225
+# v.4.4-891027226
 
 vectara:
   corpus_key: Qumulo_Main_5
   customer_id: 4077139778
   reindex: true
   remove_boilerplate: true
+  requests_per_second: 5
+  max_retries: 5
+  timeout: 90
 
 crawling:
   crawler_type: website
@@ -20,12 +23,12 @@ website_crawler:
  #crawl_report: true
  #timeout: 30
  #post_load_timeout: 30
-  ray_workers: 40
+  ray_workers: 16
   remove_old_content: true
-  html_processing:
-    ids_to_remove: []
-    classes_to_remove: []
-    tags_to_remove: []
+ #html_processing:
+   #ids_to_remove: []
+   #classes_to_remove: []
+   #tags_to_remove: []
 
 doc_processing:
   summarize_tables: false
