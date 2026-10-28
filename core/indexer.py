@@ -5,6 +5,7 @@ import time
 import warnings
 import base64
 import hashlib
+import re
 from typing import Dict, Any, List, Optional, Sequence, Tuple
 from collections import OrderedDict
 import shutil
@@ -48,13 +49,15 @@ from core.indexer_utils import (
 from core.incremental import (
     compute_fingerprint, config_signature, content_hash_from_text, source_tag_for,
 )
-from core.web_extractor_base import create_web_extractor
+from core.web_extractor_base import create_web_extractor, parse_static_html
 from core.file_processor import FileProcessor
 from core.document_builder import MAX_SECTION_CHARS, MAX_PART_SIZE
 
 # Suppress FutureWarning related to torch.load
 warnings.filterwarnings("ignore", category=FutureWarning, module="whisper")
 warnings.filterwarnings("ignore", category=UserWarning, message="FP16 is not supported on CPU; using FP32 instead")
+
+_META_REFRESH = re.compile(r'<meta[^>]+http-equiv\s*=\s*["\']?refresh', re.IGNORECASE)
 
 
 def _document_has_oversized_part(document: Dict[str, Any]) -> bool:
@@ -514,8 +517,9 @@ class Indexer:
     def was_skipped(self) -> bool:
         """True if the most recent index_* call skipped an unchanged document (incremental).
         Lets crawler workers distinguish a skip from a fresh index without poking at the
-        last_skip_reason attribute directly."""
-        return self.last_skip_reason == "unchanged"
+        last_skip_reason attribute directly. Redirect stubs passed to index_url(html=...)
+        also count as skipped."""
+        return self.last_skip_reason in ("unchanged", "redirect")
 
     def stamp_subdoc_metadata(self, sub_metadata: Dict[str, Any], parent_doc_id: str) -> None:
         """Tag a sub-document (image / PDF part / media transcript / spreadsheet sheet) so the
@@ -779,7 +783,8 @@ class Indexer:
 
 
     def index_url(self, url: str, metadata: Dict[str, Any], html_processing: dict = None,
-                  metadata_extractor: callable = None, prior_fingerprint: Optional[str] = None) -> bool:
+                  metadata_extractor: callable = None, prior_fingerprint: Optional[str] = None,
+                  html: Optional[str] = None) -> bool:
         """
         Index a url by rendering it, extracting content and metadata, then uploading to the Vectara corpus.
 
@@ -790,6 +795,8 @@ class Indexer:
             metadata_extractor (callable): Optional function to extract additional metadata from HTML.
                 Function signature: fn(html: str) -> Dict[str, Any]
                 The extractor should return only metadata fields to be indexed.
+            html (str): Optional pre-fetched, server-rendered HTML for `url` (e.g. read from a
+                local mirror). When given, no network fetch of `url` is made.
 
         Returns:
             bool: True if the upload was successful, False otherwise.
@@ -802,7 +809,7 @@ class Indexer:
         url = url.split("#")[0]  # remove fragment, if exists
 
         # if file is going to download, then handle it as local file
-        if self.url_triggers_download(url):
+        if html is None and self.url_triggers_download(url):
             os.makedirs("/tmp", exist_ok=True)
             url_file_path = get_file_path_from_url(url)
             if not url_file_path:
@@ -824,7 +831,7 @@ class Indexer:
                 return False
 
         # If MD or IPYNB file, then we don't need playwright - can just download content directly and convert to text
-        if url.lower().endswith(".md") or url.lower().endswith(".ipynb"):
+        if html is None and (url.lower().endswith(".md") or url.lower().endswith(".ipynb")):
             response = self.session.get(url, timeout=self.timeout)
             response.raise_for_status()
             dl_content = response.content.decode('utf-8')
@@ -841,7 +848,7 @@ class Indexer:
         else:
             try:
                 # Check if URL triggers download or serves PDF content
-                result = self.check_download_or_pdf(url)
+                result = {"type": "html"} if html is not None else self.check_download_or_pdf(url)
                 
                 if result["type"] == "download":
                     # Handle explicit download
@@ -879,13 +886,25 @@ class Indexer:
                     return res
 
                 # If not download or PDF, fetch the page content
-                res = self.fetch_page_contents(
-                    url=url,
-                    extract_tables=self.parse_tables,
-                    extract_images=False,
-                    remove_code=self.remove_code,
-                    html_processing=html_processing,
-                )
+                if html is not None:
+                    res = parse_static_html(html, url)
+                    if res is None:
+                        # A static site's redirect stub (e.g. jekyll-redirect-from); its target
+                        # is indexed under its own URL, so this is a skip, not a failure.
+                        if _META_REFRESH.search(html):
+                            logger.info(f"Skipping {url}: redirect stub")
+                            self.last_skip_reason = "redirect"
+                            return True
+                        logger.warning(f"Skipping {url}: provided HTML is too sparse to index")
+                        return False
+                else:
+                    res = self.fetch_page_contents(
+                        url=url,
+                        extract_tables=self.parse_tables,
+                        extract_images=False,
+                        remove_code=self.remove_code,
+                        html_processing=html_processing,
+                    )
                 # If the fetch was bounced to a sign-in / IdP page, treat it
                 # as a crawl failure: do not index the login form's HTML.
                 auth_reason = auth_redirect_reason(url, res.get('url'))
