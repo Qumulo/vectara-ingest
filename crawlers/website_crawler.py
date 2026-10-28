@@ -12,6 +12,7 @@ from core.utils import (
 )
 from core.indexer import Indexer
 from core.indexer_utils import normalize_url_for_metadata
+from core.local_mirror import LocalMirrorAdapter
 from core.incremental import build_manifest, plan_deletions, prefilter_unchanged
 from core.spider import run_link_spider_isolated, recursive_crawl, sitemap_to_urls, sitemap_to_urls_with_meta
 from crawlers.auth.saml_manager import SAMLAuthManager
@@ -37,6 +38,20 @@ def _pick_google_target_url(cfg) -> str | None:
         return None
     first = urls[0]
     return first if isinstance(first, str) and first else None
+
+
+def _mount_local_mirror(cfg, session) -> str | None:
+    """Serve `website_crawler.local_mirror.url_prefix` from a local copy of the built site
+    (e.g. a gh-pages checkout) on `session`, so discovery and page fetches never hit the
+    live site. Returns the mounted prefix, or None when no mirror is configured."""
+    mirror = cfg.get('website_crawler', {}).get('local_mirror')
+    if not mirror:
+        return None
+    root = get_docker_or_local_path(docker_path="/home/vectara/data", config_path=mirror['path'])
+    adapter = LocalMirrorAdapter(mirror['url_prefix'], root)
+    session.mount(adapter.url_prefix, adapter)
+    logger.info(f"Serving {adapter.url_prefix} from local mirror {root}")
+    return adapter.url_prefix
 
 
 def _transfer_session_to_context(context, session):
@@ -147,6 +162,7 @@ class PageCrawlWorker(object):
         self.saml_config = website_crawler_cfg.get('saml_auth')
         self.google_config = website_crawler_cfg.get('google_auth')
         self.scrape_method = website_crawler_cfg.get('scrape_method', 'playwright')
+        self.mirror_prefix = None
 
     def setup(self):
         """
@@ -233,6 +249,8 @@ class PageCrawlWorker(object):
             except Exception as e:
                 logging.error(f"[Worker {worker_pid}] Fatal Google authentication failure: {e}")
                 raise
+
+        self.mirror_prefix = _mount_local_mirror(self.cfg, self.indexer.session)
     
     def cleanup(self):
         """Cleanup resources when worker is done"""
@@ -262,10 +280,15 @@ class PageCrawlWorker(object):
         logging.info(f"[Worker {os.getpid()}] Crawling and indexing {url}")
         succeeded = False
         try:
+            html = None
+            if self.mirror_prefix and url.startswith(self.mirror_prefix):
+                resp = self.indexer.session.get(url)
+                resp.raise_for_status()
+                html = resp.text
             with self.rate_limiter:
                 succeeded = self.indexer.index_url(
                     url, metadata=metadata, html_processing=self.html_processing,
-                    prior_fingerprint=prior_fingerprint)
+                    prior_fingerprint=prior_fingerprint, html=html)
             if not succeeded:
                 logging.info(f"[Worker {os.getpid()}] Indexing failed for {url}")
             else:
@@ -390,6 +413,7 @@ class WebsiteCrawler(Crawler):
         """Main crawl orchestration method."""
         # 1. Configuration and setup
         self._configure_indexer_session()
+        _mount_local_mirror(self.cfg, self.indexer.session)
         
         # 2. Discover all URLs using the chosen method
         all_urls = self._discover_urls()
