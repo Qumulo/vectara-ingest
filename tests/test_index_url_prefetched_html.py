@@ -53,6 +53,17 @@ class TestIndexUrlPrefetchedHtml(unittest.TestCase):
         ix = _make_indexer()
         self.assertFalse(ix.index_url(URL, metadata={"url": URL}, html="<html><body>stub</body></html>"))
         ix.index_segments.assert_not_called()
+        self.assertFalse(ix.was_skipped())
+
+    def test_redirect_stub_is_skipped_not_failed(self):
+        # jekyll-redirect-from stub: the target page is listed and indexed on its own.
+        stub = ('<!DOCTYPE html><html><title>Redirecting&hellip;</title>'
+                '<meta http-equiv="refresh" content="0; url=https://docs.example.com/new.html">'
+                '<meta name="robots" content="noindex"><h1>Redirecting&hellip;</h1></html>')
+        ix = _make_indexer()
+        self.assertTrue(ix.index_url(URL, metadata={"url": URL}, html=stub))
+        self.assertTrue(ix.was_skipped())
+        ix.index_segments.assert_not_called()
 
 
 if __name__ == "__main__":

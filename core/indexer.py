@@ -5,6 +5,7 @@ import time
 import warnings
 import base64
 import hashlib
+import re
 from typing import Dict, Any, List, Optional, Sequence, Tuple
 from collections import OrderedDict
 import shutil
@@ -55,6 +56,8 @@ from core.document_builder import MAX_SECTION_CHARS, MAX_PART_SIZE
 # Suppress FutureWarning related to torch.load
 warnings.filterwarnings("ignore", category=FutureWarning, module="whisper")
 warnings.filterwarnings("ignore", category=UserWarning, message="FP16 is not supported on CPU; using FP32 instead")
+
+_META_REFRESH = re.compile(r'<meta[^>]+http-equiv\s*=\s*["\']?refresh', re.IGNORECASE)
 
 
 def _document_has_oversized_part(document: Dict[str, Any]) -> bool:
@@ -514,8 +517,9 @@ class Indexer:
     def was_skipped(self) -> bool:
         """True if the most recent index_* call skipped an unchanged document (incremental).
         Lets crawler workers distinguish a skip from a fresh index without poking at the
-        last_skip_reason attribute directly."""
-        return self.last_skip_reason == "unchanged"
+        last_skip_reason attribute directly. Redirect stubs passed to index_url(html=...)
+        also count as skipped."""
+        return self.last_skip_reason in ("unchanged", "redirect")
 
     def stamp_subdoc_metadata(self, sub_metadata: Dict[str, Any], parent_doc_id: str) -> None:
         """Tag a sub-document (image / PDF part / media transcript / spreadsheet sheet) so the
@@ -885,6 +889,12 @@ class Indexer:
                 if html is not None:
                     res = parse_static_html(html, url)
                     if res is None:
+                        # A static site's redirect stub (e.g. jekyll-redirect-from); its target
+                        # is indexed under its own URL, so this is a skip, not a failure.
+                        if _META_REFRESH.search(html):
+                            logger.info(f"Skipping {url}: redirect stub")
+                            self.last_skip_reason = "redirect"
+                            return True
                         logger.warning(f"Skipping {url}: provided HTML is too sparse to index")
                         return False
                 else:
