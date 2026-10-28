@@ -16,8 +16,10 @@ website_crawler:
   urls: [https://qumulo.com]
   pos_regex: ["^https:\/\/qumulo.com\/?(.*)?$"]
  #neg_regex: [".*care.qumulo.*",".*docs.qumulo.com.*"]
-  pages_source: crawl
-  extraction: playwright
+ #pages_source: crawl
+  pages_source: sitemap
+ #extraction: playwright
+  extraction: beautifulsoup
   delay: 1
   max_depth: 2
  #crawl_report: true
