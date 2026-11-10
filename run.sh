@@ -405,6 +405,18 @@ case "$crawler_type" in
     DOCKER_RUN_ARGS+=(-v "${file_path}:/home/vectara/data/${file_name}")
     ;;
 
+  website)
+    # Mount the built site (e.g. a gh-pages checkout) for website_crawler.local_mirror
+    mirror=$(read_yaml_nested "(data['website_crawler'].get('local_mirror') or {}).get('path', '')")
+    if [[ -n "$mirror" ]]; then
+      if [[ ! -d "$mirror" ]]; then
+        echo "Error: local_mirror path '$mirror' does not exist." >&2
+        exit "$ERR_MISSING_DATA_DIR"
+      fi
+      DOCKER_RUN_ARGS+=(-v "${mirror}:/home/vectara/data:ro")
+    fi
+    ;;
+
   bulkupload)
     # Mount JSON file for bulkupload crawler
     json_path=$(read_yaml_nested "data['bulkupload_crawler']['json_path']")

@@ -6,9 +6,10 @@ import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from omegaconf import OmegaConf
 from core.utils import get_headers
-from core.web_extractor_base import WebExtractorBase
+from core.web_extractor_base import WebExtractorBase, parse_static_html
 
 logger = logging.getLogger(__name__)
+
 
 
 class WebContentExtractor(WebExtractorBase):
@@ -404,40 +405,13 @@ class WebContentExtractor(WebExtractorBase):
         # prevent the authenticated Playwright context from ever running.
         if not self.skip_static_prefetch:
             try:
-                from bs4 import BeautifulSoup
                 static_resp = requests.get(url, headers=get_headers(self.cfg), timeout=30, allow_redirects=True)
                 static_resp.raise_for_status()
                 if 'text/html' in static_resp.headers.get('content-type', '').lower():
-                    soup = BeautifulSoup(static_resp.text, 'html.parser')
-                    static_text = soup.get_text(separator=' ', strip=True)
-                    if len(static_text.strip()) > 500:
-                        result['html'] = static_resp.text
-                        result['url'] = static_resp.url
-                        result['title'] = soup.title.string if soup.title else ''
-                        result['text'] = static_text
-                        result['links'] = [a['href'] for a in soup.find_all('a', href=True)]
-                        # Extract images with same filtering as the browser path
-                        from urllib.parse import urljoin
-                        for img_tag in soup.find_all('img'):
-                            src = img_tag.get('src', '')
-                            if not src or src.startswith('data:') or src.startswith('blob:'):
-                                continue
-                            try:
-                                w = int(img_tag.get('width', '0') or '0')
-                            except (ValueError, TypeError):
-                                w = 0
-                            try:
-                                h = int(img_tag.get('height', '0') or '0')
-                            except (ValueError, TypeError):
-                                h = 0
-                            if (w > 0 and w < 10) or (h > 0 and h < 10):
-                                continue
-                            result['images'].append({'src': urljoin(url, src), 'alt': img_tag.get('alt', '')})
-                        logger.info(f"Static fetch used for {url}: {len(static_text)} chars")
-                        logger.info(f"For crawled page {url}: images = {len(result['images'])}, "
-                                    f"tables = {len(result['tables'])}, links = {len(result['links'])}")
-                        return result
-                    logger.debug(f"Static fetch for {url} too sparse ({len(static_text)} chars), falling back to browser")
+                    static_result = parse_static_html(static_resp.text, url, final_url=static_resp.url)
+                    if static_result:
+                        return static_result
+                    logger.debug(f"Static fetch for {url} too sparse, falling back to browser")
             except Exception as e:
                 logger.debug(f"Static pre-fetch failed for {url}, using browser: {e}")
 
