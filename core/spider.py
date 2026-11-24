@@ -2,6 +2,7 @@ import re
 from typing import Set, Optional, List, Iterable
 import logging
 import multiprocessing
+import time
 import gzip
 from urllib.parse import urlparse, urljoin
 import requests
@@ -18,13 +19,14 @@ from scrapy.utils.sitemap import Sitemap
 from scrapy.spiders.sitemap import iterloc
 
 
+from core.crawl_tracker import CrawlShutdownException
 from core.indexer import Indexer
 from core.indexer_utils import auth_redirect_reason, is_auth_host
-from core.utils import img_extensions, audio_extensions, video_extensions, doc_extensions, archive_extensions, url_matches_patterns
+from core.utils import (img_extensions, audio_extensions, video_extensions, archive_extensions, url_matches_patterns,
+                        WEB_FILE_EXTENSIONS)
 
 # Configure logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
 
 def _url_is_relative(url: str) -> bool:
@@ -34,7 +36,7 @@ def _url_is_relative(url: str) -> bool:
 def recursive_crawl(url: str, depth: int, 
                     pos_patterns: List[re.Pattern], neg_patterns: List[re.Pattern], 
                     indexer: Indexer, visited: Optional[Set[str]]=None, 
-                    verbose: bool = False) -> Set[str]:
+                    verbose: bool = False, rate_controller=None, sleep=time.sleep) -> Set[str]:
     """
     Recursively crawl a URL and extract all links from it.
     """    
@@ -51,7 +53,7 @@ def recursive_crawl(url: str, depth: int,
     visited.add(url)
 
     # for document files (like PPT, DOCX, etc) we don't extract links from the URL, but the link itself is included. 
-    if any([current_path_lower.endswith(ext) for ext in doc_extensions]):
+    if any([current_path_lower.endswith(ext) for ext in WEB_FILE_EXTENSIONS]):
         return visited
 
     # if we reached the maximum depth, stop and return the visited URLs
@@ -59,6 +61,12 @@ def recursive_crawl(url: str, depth: int,
         return visited
 
     try:
+        if rate_controller:
+            wait = rate_controller.acquire()
+            if wait is None:
+                indexer.discovery_rate_limited = True
+                return visited
+            sleep(wait)
         res = indexer.fetch_page_contents(url)
         # If the fetch was bounced to a sign-in / IdP page, drop link extraction:
         # the page we landed on is the IdP's login form, not real content, and
@@ -70,6 +78,20 @@ def recursive_crawl(url: str, depth: int,
                 f"Configure website_crawler.google_auth / saml_auth to crawl it."
             )
             return visited
+        # The links on a 429 page aren't the site's, and the real ones are unknown, so the
+        # discovered set is incomplete: the flag stops old content being removed on this run.
+        if res.get('status_code') == 429:
+            logger.warning(f"Discovery from {url} got HTTP 429: pages linked only from it are not crawled")
+            indexer.discovery_rate_limited = True
+            if rate_controller:
+                rate_controller.report_429(res.get('retry_after'))
+            return visited
+        if rate_controller:
+            if res.get('throttled'):
+                rate_controller.report_429(res.get('retry_after'))
+            # A failed fetch (no html, or an error page) is no sign the site has stopped refusing.
+            if res.get('html') and (res.get('status_code') or 200) < 400:
+                rate_controller.report_ok()
         new_urls = [urljoin(url, u) if _url_is_relative(u) else u for u in res['links']]  # convert all new URLs to absolute URLs
         new_urls = [u for u in new_urls 
                     if      u not in visited and u.startswith('http') and 
@@ -85,7 +107,10 @@ def recursive_crawl(url: str, depth: int,
                 logger.info(f"URLs so far: {visited}")
 
         for new_url in new_urls:
-            visited = recursive_crawl(new_url, depth-1, pos_patterns, neg_patterns, indexer, visited, verbose)
+            visited = recursive_crawl(new_url, depth-1, pos_patterns, neg_patterns, indexer, visited, verbose,
+                                      rate_controller, sleep)
+    except CrawlShutdownException:
+        raise
     except Exception as e:
         logger.error(f"recursive_crawl failed for {url} ({type(e).__name__}: {e}); "
                      "links discovered from this page may be incomplete")
@@ -93,7 +118,7 @@ def recursive_crawl(url: str, depth: int,
     return set(visited)
 
 DISALLOWED_REDIRECT_EXTENSIONS = tuple(
-    ext.lower() for ext in (doc_extensions + archive_extensions + img_extensions)
+    ext.lower() for ext in (WEB_FILE_EXTENSIONS + archive_extensions + img_extensions)
 )
 class FilterRedirectsByTypeMiddleware(RedirectMiddleware):
 
@@ -187,7 +212,7 @@ class LinkSpider(scrapy.Spider):
         parsed_url = urlparse(url)
         path_lower = parsed_url.path.lower()
 
-        if any([path_lower.endswith(ext) for ext in (doc_extensions + archive_extensions + img_extensions + audio_extensions + video_extensions)]):
+        if any([path_lower.endswith(ext) for ext in (WEB_FILE_EXTENSIONS + archive_extensions + img_extensions + audio_extensions + video_extensions)]):
             return False
 
         if parsed_url.scheme.lower() not in ['http', 'https']:
@@ -227,7 +252,7 @@ class LinkSpider(scrapy.Spider):
             return
         
         # For document files, yield the URL but do not attempt to extract links.
-        if any([response_path_lower.endswith(ext) for ext in doc_extensions]):
+        if any([response_path_lower.endswith(ext) for ext in WEB_FILE_EXTENSIONS]):
             extract_links = False
             
         # 1) If this URL itself is valid, yield it
